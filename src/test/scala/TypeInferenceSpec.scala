@@ -353,4 +353,34 @@ class TypeInferenceSpec extends AnyFunSuite with Matchers {
     )
     result shouldBe Some("Coll[Long]")
   }
+
+  test("Infer type for simple tuple with Long and Int") {
+    val result = TypeInference.inferType("(100L, 1000)")
+    result shouldBe Some("(Long, Int)")
+  }
+
+  test("Infer type for tuple with different types") {
+    val result = TypeInference.inferType("(true, 42)")
+    result shouldBe Some("(Boolean, Int)")
+  }
+
+  test("Infer type for three-element tuple") {
+    val result = TypeInference.inferType("(100L, 1000, true)")
+    result shouldBe Some("(Long, Int, Boolean)")
+  }
+
+  test("Infer type for tuple with expressions") {
+    val result = TypeInference.inferType("(HEIGHT, SELF.value)")
+    result shouldBe Some("(Int, Long)")
+  }
+
+  test("Infer type for nested tuple") {
+    val result = TypeInference.inferType("((1, 2), 3)")
+    result shouldBe Some("((Int, Int), Int)")
+  }
+
+  test("Infer type for tuple with byte array") {
+    val result = TypeInference.inferType("(fromBase58(\"test\"), 100)")
+    result shouldBe Some("(Coll[Byte], Int)")
+  }
 }

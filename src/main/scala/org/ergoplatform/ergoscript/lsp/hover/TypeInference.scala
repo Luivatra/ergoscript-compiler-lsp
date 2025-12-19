@@ -388,6 +388,28 @@ object TypeInference extends LazyLogging {
         )
       case s if s.contains(".fold(") => Some("T")
 
+      // Tuple literals
+      case s if s.startsWith("(") && s.endsWith(")") && s.contains(",") =>
+        // Try to infer tuple type
+        val content = s.substring(1, s.length - 1).trim
+        if (content.nonEmpty) {
+          // Split by comma, handling nested structures
+          val elements = splitTupleElements(content)
+          if (elements.size >= 2) {
+            val types =
+              elements.flatMap(elem => inferType(elem.trim, knownSymbols))
+            if (types.size == elements.size) {
+              Some(s"(${types.mkString(", ")})")
+            } else {
+              None
+            }
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+
       // Literals
       case "true" | "false"                            => Some("Boolean")
       case s if s.matches("\\d+L")                     => Some("Long")
@@ -409,6 +431,40 @@ object TypeInference extends LazyLogging {
     }
 
     inferredType
+  }
+
+  /** Split tuple elements by comma, handling nested parentheses.
+    *
+    * Example: "100L, 1000" => List("100L", "1000") Example: "(1, 2), 3" =>
+    * List("(1, 2)", "3")
+    */
+  private def splitTupleElements(content: String): List[String] = {
+    var depth = 0
+    var currentElement = new StringBuilder
+    val elements = scala.collection.mutable.ListBuffer[String]()
+
+    for (c <- content) {
+      c match {
+        case '(' | '[' | '{' =>
+          depth += 1
+          currentElement.append(c)
+        case ')' | ']' | '}' =>
+          depth -= 1
+          currentElement.append(c)
+        case ',' if depth == 0 =>
+          elements += currentElement.toString.trim
+          currentElement = new StringBuilder
+        case _ =>
+          currentElement.append(c)
+      }
+    }
+
+    // Add the last element
+    if (currentElement.nonEmpty) {
+      elements += currentElement.toString.trim
+    }
+
+    elements.toList
   }
 
   /** Try to infer the return type of a lambda expression.
