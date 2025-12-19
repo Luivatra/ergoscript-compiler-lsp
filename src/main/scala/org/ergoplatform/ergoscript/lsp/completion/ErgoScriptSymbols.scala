@@ -34,6 +34,17 @@ object ErgoScriptSymbols {
         Some("def ${1:name}(${2:params}): ${3:ReturnType} = ${4:body}")
     ),
     CompletionItem(
+      label = "@contract",
+      kind = Some(KeywordKind),
+      detail = Some("EIP-5 annotation"),
+      documentation = Some(
+        "Define a contract template with named parameters (EIP-5). Must be preceded by a /* */ comment block with @param tags."
+      ),
+      insertText = Some(
+        "/*\n * ${1:Contract description}\n *\n * @param ${2:paramName} ${3:Parameter description}\n */\n@contract def ${4:contractName}(${2:paramName}: ${5:Type} = ${6:defaultValue}) = {\n  ${7:body}\n}"
+      )
+    ),
+    CompletionItem(
       label = "if",
       kind = Some(KeywordKind),
       detail = Some("keyword"),

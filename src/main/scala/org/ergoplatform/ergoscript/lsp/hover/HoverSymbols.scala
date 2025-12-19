@@ -27,6 +27,19 @@ object HoverSymbols {
         "val amount = SELF.value"
       )
     ),
+    "@contract" -> HoverInfo(
+      signature = Some(
+        "/* docstring */ @contract def name(param: Type = default, ...) = { body }"
+      ),
+      description =
+        "EIP-5 contract template annotation. Defines a reusable contract with named parameters that can be instantiated with different values. Must be preceded by a /* */ comment block with @param tags for each parameter. Parameters must have type annotations and default values.",
+      category = Some("Annotation"),
+      examples = List(
+        "/* @param minHeight Minimum block height */ @contract def heightLock(minHeight: Int = 100) = { HEIGHT > minHeight }",
+        "/* @param threshold Required signatures @param keys Public keys */ @contract def multiSig(threshold: Int = 2, keys: Coll[SigmaProp]) = { atLeast(threshold, keys) }"
+      ),
+      related = List("def", "val")
+    ),
     "if" -> HoverInfo(
       signature = Some("if (condition) trueCase else falseCase"),
       description =

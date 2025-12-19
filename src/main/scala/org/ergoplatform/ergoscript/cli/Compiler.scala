@@ -1,11 +1,12 @@
 package org.ergoplatform.ergoscript.cli
 
-import org.ergoplatform.ergoscript.eip5.{ContractTemplate, Parameter}
+import org.ergoplatform.sdk.{ContractTemplate, Parameter}
 import sigma.ast.{ErgoTree, SourceContext}
 import sigma.serialization.ErgoTreeSerializer
-import sigma.compiler.SigmaCompiler
+import sigma.compiler.{SigmaCompiler, SigmaTemplateCompiler}
 import sigma.compiler.ir.IRContext
 import sigma.SigmaException
+import sigmastate.lang.{ContractParser, ParsedContractTemplate}
 import scorex.util.encode.Base16
 import com.typesafe.scalalogging.LazyLogging
 
@@ -27,12 +28,60 @@ object Compiler extends LazyLogging {
   // Implicit IRContext required by SigmaCompiler
   implicit val IR: IRContext = new sigma.compiler.ir.CompiletimeIRContext()
 
+  /** Compile ErgoScript with automatic template detection. If the script
+    * contains @contract annotations, uses SigmaTemplateCompiler for EIP-5
+    * compliant template generation. Otherwise, uses standard compilation.
+    */
   def compile(
       script: String,
       name: String,
       description: String,
       networkPrefix: Byte = 0x00, // Mainnet
       treeVersion: Byte = ErgoTree.VersionFlag
+  ): Either[CompilationError, CompilationResult] = {
+    // Check if script contains EIP-5 annotations
+    if (script.contains("@contract") || script.contains("@param")) {
+      compileTemplate(script, networkPrefix, treeVersion)
+    } else {
+      compileStandard(script, name, description, networkPrefix, treeVersion)
+    }
+  }
+
+  /** Compile using SigmaTemplateCompiler for EIP-5 template support. The script
+    * should follow EIP-5 contract template syntax with @contract decorator.
+    */
+  private def compileTemplate(
+      script: String,
+      networkPrefix: Byte,
+      treeVersion: Byte
+  ): Either[CompilationError, CompilationResult] = {
+    Try {
+      val templateCompiler = SigmaTemplateCompiler(networkPrefix)
+      val template = templateCompiler.compile(script)
+
+      // Build ErgoTree from the template's expression tree (which is a SigmaProp)
+      val ergoTree = ErgoTree.fromProposition(
+        ErgoTree.HeaderType @@ treeVersion,
+        template.expressionTree
+      )
+
+      CompilationResult(ergoTree, template)
+    } match {
+      case Success(result) => Right(result)
+      case Failure(ex) =>
+        logger.error("Template compilation failed", ex)
+        Left(extractCompilationError(ex))
+    }
+  }
+
+  /** Standard compilation without EIP-5 template features.
+    */
+  private def compileStandard(
+      script: String,
+      name: String,
+      description: String,
+      networkPrefix: Byte,
+      treeVersion: Byte
   ): Either[CompilationError, CompilationResult] = {
     Try {
       // Use SigmaCompiler to compile ErgoScript
@@ -47,53 +96,23 @@ object Compiler extends LazyLogging {
         value.toSigmaProp
       )
 
-      // Serialize the ErgoTree
-      val ergoTreeBytes =
-        ErgoTreeSerializer.DefaultSerializer.serializeErgoTree(ergoTree)
-
-      // Extract constants for EIP-5 format
+      // Extract constants for SDK ContractTemplate format
       val constants = ergoTree.constants
-
-      val constTypes = if (constants.nonEmpty) {
-        constants.map { const =>
-          // Serialize type
-          val w = sigma.serialization.SigmaSerializer.startWriter()
-          sigma.serialization.TypeSerializer.serialize(const.tpe, w)
-          "0x" + Base16.encode(w.toBytes)
-        }
-      } else {
-        Seq.empty[String]
-      }
-
+      val constTypes = constants.map(_.tpe).toIndexedSeq
       val constValues = if (constants.nonEmpty) {
-        constants.map { const =>
-          // Serialize value
-          val w = sigma.serialization.SigmaSerializer.startWriter()
-          sigma.serialization.DataSerializer.serialize(
-            const.value,
-            const.tpe,
-            w
-          )
-          Some("0x" + Base16.encode(w.toBytes))
-        }
+        Some(constants.map(c => Some(c.value)).toIndexedSeq)
       } else {
-        Seq.empty[Option[String]]
+        None
       }
 
-      // Expression tree is the full serialized tree for now
-      // In a full implementation, this would exclude the constants section
-      val expressionTree = "0x" + Base16.encode(ergoTreeBytes)
-
-      // Create default parameters (can be enhanced to extract from script comments/annotations)
-      val parameters = Seq.empty[Parameter]
-
+      // Create basic template without parameters (standard compilation)
       val template = ContractTemplate(
         name = name,
         description = description,
         constTypes = constTypes,
         constValues = constValues,
-        parameters = parameters,
-        expressionTree = expressionTree
+        parameters = IndexedSeq.empty[Parameter],
+        expressionTree = value.toSigmaProp
       )
 
       CompilationResult(ergoTree, template)

@@ -19,6 +19,7 @@ object TypeInference extends LazyLogging {
   )
 
   /** Extract all user-defined symbols (val declarations) from the document.
+    * Also extracts parameters from EIP-5 @contract definitions.
     *
     * @param documentText
     *   The full document text
@@ -28,23 +29,37 @@ object TypeInference extends LazyLogging {
   def extractUserDefinedSymbols(
       documentText: String
   ): Map[String, UserSymbol] = {
-    // Pattern to match: val <name> = <expression>
-    // Handles both simple and multi-line expressions
-    val valPattern = """val\s+(\w+)\s*=\s*([^\n]+)""".r
-
-    val lines = documentText.split("\n")
     val symbols = scala.collection.mutable.Map[String, UserSymbol]()
 
+    // Pattern to match: val <name> = <expression>
+    val valPattern = """val\s+(\w+)\s*=\s*([^\n]+)""".r
     valPattern.findAllMatchIn(documentText).foreach { m =>
       val name = m.group(1)
       val expression = m.group(2).trim
+      val matchStart = m.start
+      val lineNumber = documentText.substring(0, matchStart).count(_ == '\n')
+      symbols(name) = UserSymbol(name, expression, lineNumber)
+      logger.debug(s"Found user symbol: $name = $expression (line $lineNumber)")
+    }
 
-      // Find line number
+    // Extract EIP-5 contract parameters: @contract def name(param: Type = value, ...)
+    val contractPattern =
+      """@contract\s+def\s+\w+\s*\(((?:[^()]|\([^)]*\))*)\)""".r
+    contractPattern.findAllMatchIn(documentText).foreach { m =>
+      val paramsText = m.group(1)
       val matchStart = m.start
       val lineNumber = documentText.substring(0, matchStart).count(_ == '\n')
 
-      symbols(name) = UserSymbol(name, expression, lineNumber)
-      logger.debug(s"Found user symbol: $name = $expression (line $lineNumber)")
+      // Extract individual parameters: name: Type = defaultValue
+      val paramPattern = """(\w+)\s*:\s*[\w\[\]]+\s*=\s*([^,)]+)""".r
+      paramPattern.findAllMatchIn(paramsText).foreach { pm =>
+        val paramName = pm.group(1)
+        val paramValue = pm.group(2).trim
+        symbols(paramName) = UserSymbol(paramName, paramValue, lineNumber)
+        logger.debug(
+          s"Found EIP-5 parameter: $paramName = $paramValue (line $lineNumber)"
+        )
+      }
     }
 
     symbols.toMap
