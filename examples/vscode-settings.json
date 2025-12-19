@@ -1,0 +1,15 @@
+{
+  "// VS Code settings for ErgoScript LSP": "",
+  "// Add this to your workspace or user settings.json": "",
+  "ergoscript.lsp.command": "java",
+  "ergoscript.lsp.args": [
+    "-jar",
+    "/absolute/path/to/ergoscript-compiler-lsp.jar",
+    "lsp"
+  ],
+  "// Optional: File associations": "",
+  "files.associations": {
+    "*.es": "ergoscript",
+    "*.ergo": "ergoscript"
+  }
+}

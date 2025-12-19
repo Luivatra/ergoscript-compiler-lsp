@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!--
+        CRITICAL: LSP uses stdout for JSON-RPC communication.
+        All logging MUST go to stderr to avoid corrupting the protocol.
+    -->
+
+    <!-- Console appender to STDERR -->
+    <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- File appender (optional, for persistent logs) -->
+    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+        <file>ergoscript-lsp.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Root logger configuration -->
+    <root level="INFO">
+        <appender-ref ref="STDERR" />
+        <appender-ref ref="FILE" />
+    </root>
+
+    <!-- Package-specific log levels (adjust as needed) -->
+    <logger name="org.ergoplatform.ergoscript" level="DEBUG" />
+    <logger name="org.eclipse.lsp4j" level="WARN" />
+
+</configuration>
