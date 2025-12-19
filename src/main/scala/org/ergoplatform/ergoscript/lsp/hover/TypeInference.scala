@@ -71,13 +71,33 @@ object TypeInference extends LazyLogging {
 
     // Collection constructor
     if (expr.startsWith("Coll(")) {
-      // Try to infer element type from first element
-      val insideParens = expr.substring(5, expr.lastIndexOf(')'))
-      val firstElement = insideParens.split(",").headOption.map(_.trim)
-      firstElement.flatMap(inferType(_, knownSymbols)) match {
-        case Some(elemType) => return Some(s"Coll[$elemType]")
-        case None =>
-          return Some("Coll[Int]") // Default to Int if we can't infer
+      // Find the matching closing parenthesis for Coll(...)
+      var depth = 0
+      var closingIdx = -1
+      var i = 5
+      while (i < expr.length && closingIdx < 0) {
+        expr.charAt(i) match {
+          case '(' => depth += 1
+          case ')' =>
+            if (depth == 0) {
+              closingIdx = i
+            } else {
+              depth -= 1
+            }
+          case _ => // Ignore other characters
+        }
+        i += 1
+      }
+
+      // Only process if we found the closing paren and no chained methods
+      if (closingIdx > 5 && closingIdx == expr.length - 1) {
+        val insideParens = expr.substring(5, closingIdx)
+        val firstElement = insideParens.split(",").headOption.map(_.trim)
+        firstElement.flatMap(inferType(_, knownSymbols)) match {
+          case Some(elemType) => return Some(s"Coll[$elemType]")
+          case None =>
+            return Some("Coll[Int]") // Default to Int if we can't infer
+        }
       }
     }
 
@@ -187,23 +207,83 @@ object TypeInference extends LazyLogging {
         return inferType(beforeFilter, knownSymbols)
       } else if (lastMethodIdx == mapIdx) {
         val beforeMap = expr.substring(0, mapIdx)
+        val afterMap = expr.substring(mapIdx + 4).trim // Skip ".map"
+
         inferType(beforeMap, knownSymbols) match {
           case Some(tpe) if tpe.startsWith("Coll[") =>
-            return Some("Coll[T]")
+            // Extract the element type to pass to lambda inference
+            val elemType = tpe.stripPrefix("Coll[").stripSuffix("]")
+            // Try to infer the return type from the lambda
+            val lambdaReturnType =
+              inferLambdaReturnType(afterMap, knownSymbols, Some(elemType))
+            return Some(
+              lambdaReturnType.map(t => s"Coll[$t]").getOrElse("Coll[T]")
+            )
           case Some(tpe) if tpe.startsWith("Option[") =>
-            return Some("Option[T]")
+            val elemType = tpe.stripPrefix("Option[").stripSuffix("]")
+            val lambdaReturnType =
+              inferLambdaReturnType(afterMap, knownSymbols, Some(elemType))
+            return Some(
+              lambdaReturnType.map(t => s"Option[$t]").getOrElse("Option[T]")
+            )
           case _ => // Continue
         }
       } else if (lastMethodIdx == flatMapIdx) {
-        return Some("Coll[T]")
+        val beforeFlatMap = expr.substring(0, flatMapIdx)
+        val afterFlatMap =
+          expr.substring(flatMapIdx + 8).trim // Skip ".flatMap"
+
+        // Try to infer the inner collection type from the lambda
+        val lambdaReturnType =
+          inferLambdaReturnType(afterFlatMap, knownSymbols, None)
+        lambdaReturnType match {
+          case Some(tpe) if tpe.startsWith("Coll[") =>
+            // Extract inner type: Coll[Coll[Int]] -> Coll[Int]
+            val innerType = tpe.stripPrefix("Coll[").stripSuffix("]")
+            return Some(s"Coll[$innerType]")
+          case _ => return Some("Coll[T]")
+        }
       } else if (lastMethodIdx == foldIdx) {
-        return Some("T")
+        val afterFold = expr.substring(foldIdx + 5).trim // Skip ".fold"
+
+        // Try to extract the initial value to infer accumulator type
+        // Pattern: .fold(initialValue) { ... } or .fold(initialValue, ...)
+        val foldPattern = """[({]\s*(.+?)\s*[,)]""".r
+        foldPattern.findFirstMatchIn(afterFold) match {
+          case Some(m) =>
+            val initialValue = m.group(1).trim
+            inferType(initialValue, knownSymbols).getOrElse("T")
+          case None => "T"
+        }
+        return Some(foldPattern.findFirstMatchIn(afterFold) match {
+          case Some(m) =>
+            val initialValue = m.group(1).trim
+            inferType(initialValue, knownSymbols).getOrElse("T")
+          case None => "T"
+        })
       } else if (lastMethodIdx == zipIdx) {
         val beforeZip = expr.substring(0, zipIdx)
-        inferType(beforeZip, knownSymbols) match {
-          case Some(tpe) if tpe.startsWith("Coll[") =>
-            val innerType = tpe.stripPrefix("Coll[").stripSuffix("]")
-            return Some(s"Coll[($innerType, T)]")
+        val afterZip = expr.substring(zipIdx + 4).trim // Skip ".zip"
+
+        // Try to infer both collection types
+        val leftType = inferType(beforeZip, knownSymbols)
+
+        // Extract the argument to zip
+        val zipArgPattern = """[({]\s*(.+?)\s*[)}]\s*$""".r
+        val rightType = zipArgPattern.findFirstMatchIn(afterZip) match {
+          case Some(m) => inferType(m.group(1).trim, knownSymbols)
+          case None    => None
+        }
+
+        (leftType, rightType) match {
+          case (Some(l), Some(r))
+              if l.startsWith("Coll[") && r.startsWith("Coll[") =>
+            val leftInner = l.stripPrefix("Coll[").stripSuffix("]")
+            val rightInner = r.stripPrefix("Coll[").stripSuffix("]")
+            return Some(s"Coll[($leftInner, $rightInner)]")
+          case (Some(l), _) if l.startsWith("Coll[") =>
+            val leftInner = l.stripPrefix("Coll[").stripSuffix("]")
+            return Some(s"Coll[($leftInner, T)]")
           case _ => return Some("Coll[(T, T)]")
         }
       }
@@ -329,6 +409,43 @@ object TypeInference extends LazyLogging {
     }
 
     inferredType
+  }
+
+  /** Try to infer the return type of a lambda expression.
+    *
+    * Example: "{ x => x * 2 }" => Some("Int") Example: "{ box => box.value }"
+    * \=> Some("Long") Example: "( x => x + 1 )" => Some("Int")
+    */
+  private def inferLambdaReturnType(
+      lambdaExpr: String,
+      knownSymbols: Map[String, UserSymbol],
+      inputType: Option[String] = None
+  ): Option[String] = {
+    // Handle both { } and ( ) lambda syntax
+    val lambda = lambdaExpr.trim
+
+    // Extract the lambda parameter name and body
+    val bodyPattern = """[({]\s*(\w+)(?::\s*\w+)?\s*=>\s*(.+?)\s*[)}]\s*$""".r
+    bodyPattern.findFirstMatchIn(lambda) match {
+      case Some(m) =>
+        val paramName = m.group(1).trim
+        val body = m.group(2).trim
+
+        // Check if body is just the parameter or an arithmetic operation on it
+        if (
+          body == paramName || body.matches(s"$paramName\\s*[+\\-*/]\\s*.+")
+        ) {
+          // If we know the input type and the body uses the parameter, assume same type
+          inputType match {
+            case Some(tpe) => return Some(tpe)
+            case None      => // Continue to infer from body
+          }
+        }
+
+        // Infer the type of the lambda body
+        inferType(body, knownSymbols)
+      case None => None
+    }
   }
 
   /** Extract the type parameter from a register access expression.

@@ -266,33 +266,33 @@ class TypeInferenceSpec extends AnyFunSuite with Matchers {
 
   test("Infer type for map on collection") {
     val result = TypeInference.inferType("OUTPUTS.map { box => box.value }")
-    result shouldBe Some("Coll[T]")
+    result shouldBe Some("Coll[Long]")
   }
 
   test("Infer type for flatMap") {
     val result =
       TypeInference.inferType("OUTPUTS.flatMap { box => box.tokens }")
-    result shouldBe Some("Coll[T]")
+    result shouldBe Some("Coll[(Coll[Byte], Long)]")
   }
 
   test("Infer type for fold") {
     val result = TypeInference.inferType(
       "OUTPUTS.fold(0L) { (acc, box) => acc + box.value }"
     )
-    result shouldBe Some("T")
+    result shouldBe Some("Long")
   }
 
   test("Infer type for zip") {
     val result = TypeInference.inferType("OUTPUTS.zip(INPUTS)")
-    result shouldBe Some("Coll[(Box, T)]")
+    result shouldBe Some("Coll[(Box, Box)]")
   }
 
   test("Infer type for chained collection methods") {
     val result = TypeInference.inferType(
       "OUTPUTS.filter { box => box.value > 1000 }.map { box => box.value }"
     )
-    // After filter we have Coll[Box], then map returns Coll[T]
-    result shouldBe Some("Coll[T]")
+    // After filter we have Coll[Box], then map infers lambda return type
+    result shouldBe Some("Coll[Long]")
   }
 
   test("Infer type for exists (returns Boolean)") {
@@ -305,5 +305,52 @@ class TypeInferenceSpec extends AnyFunSuite with Matchers {
     val result =
       TypeInference.inferType("OUTPUTS.forall { box => box.value > 0 }")
     result shouldBe Some("Boolean")
+  }
+
+  // Generic type inference tests
+  test("Infer specific type for map with box.value") {
+    val result = TypeInference.inferType("OUTPUTS.map { box => box.value }")
+    result shouldBe Some("Coll[Long]")
+  }
+
+  test("Infer specific type for map with box.id") {
+    val result = TypeInference.inferType("OUTPUTS.map { box => box.id }")
+    result shouldBe Some("Coll[Coll[Byte]]")
+  }
+
+  test("Infer specific type for map with numeric operation") {
+    val result = TypeInference.inferType("Coll(1, 2, 3).map { x => x * 2 }")
+    result shouldBe Some("Coll[Int]")
+  }
+
+  test("Infer specific type for flatMap") {
+    val result =
+      TypeInference.inferType("OUTPUTS.flatMap { box => box.tokens }")
+    result shouldBe Some("Coll[(Coll[Byte], Long)]")
+  }
+
+  test("Infer specific type for zip with both sides known") {
+    val result = TypeInference.inferType("OUTPUTS.zip(INPUTS)")
+    result shouldBe Some("Coll[(Box, Box)]")
+  }
+
+  test("Infer specific type for fold with Int initial value") {
+    val result =
+      TypeInference.inferType("Coll(1, 2, 3).fold(0) { (acc, x) => acc + x }")
+    result shouldBe Some("Int")
+  }
+
+  test("Infer specific type for fold with Long initial value") {
+    val result = TypeInference.inferType(
+      "OUTPUTS.fold(0L) { (acc, box) => acc + box.value }"
+    )
+    result shouldBe Some("Long")
+  }
+
+  test("Infer specific type for chained map operations") {
+    val result = TypeInference.inferType(
+      "OUTPUTS.map { box => box.value }.map { v => v * 2 }"
+    )
+    result shouldBe Some("Coll[Long]")
   }
 }
