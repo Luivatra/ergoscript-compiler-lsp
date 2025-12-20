@@ -341,11 +341,12 @@ class SimpleLspServer(
     */
   private def publishDiagnostics(uri: String, text: String): Unit = {
     import org.ergoplatform.ergoscript.cli.Compiler
+    import org.ergoplatform.ergoscript.lsp.analysis.UnusedVariableAnalyzer
 
     logger.debug(s"Running diagnostics for $uri")
 
     // Compile the script to get errors
-    val diagnostics = Compiler.compile(
+    val errorDiagnostics = Compiler.compile(
       script = text,
       name = "DiagnosticsCheck",
       description = "",
@@ -381,9 +382,35 @@ class SimpleLspServer(
 
       case Right(_) =>
         // Compilation succeeded - no errors
-        logger.debug("Compilation successful, no diagnostics")
+        logger.debug("Compilation successful, no error diagnostics")
         List.empty[Diagnostic]
     }
+
+    // Check for unused variables (warnings)
+    val warningDiagnostics =
+      UnusedVariableAnalyzer.findUnusedVariables(text).map { unusedVar =>
+        val range = Range(
+          start = Position(
+            line = unusedVar.line,
+            character = unusedVar.column
+          ),
+          end = Position(
+            line = unusedVar.line,
+            character = unusedVar.column + unusedVar.name.length
+          )
+        )
+
+        Diagnostic(
+          range = range,
+          severity = Some(2), // Warning
+          code = None,
+          source = Some("ergoscript"),
+          message = s"Variable '${unusedVar.name}' is declared but never used"
+        )
+      }
+
+    // Combine error and warning diagnostics
+    val diagnostics = errorDiagnostics ++ warningDiagnostics
 
     val params = PublishDiagnosticsParams(
       uri = uri,
