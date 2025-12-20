@@ -70,7 +70,9 @@ object Compiler extends LazyLogging {
       case Success(result) => Right(result)
       case Failure(ex) =>
         logger.error("Template compilation failed", ex)
-        Left(extractCompilationError(ex))
+        // Calculate line offset for EIP-5 format to adjust error positions
+        val lineOffset = calculateEIP5LineOffset(script)
+        Left(extractCompilationError(ex, lineOffset, Some(script)))
     }
   }
 
@@ -121,15 +123,26 @@ object Compiler extends LazyLogging {
       case Success(result) => Right(result)
       case Failure(ex) =>
         logger.error("Compilation failed", ex)
-        Left(extractCompilationError(ex))
+        Left(extractCompilationError(ex, 0, Some(script)))
     }
   }
 
   /** Extract structured error information from various exception types. Uses
     * reflection to access the `source` field from SigmaException and its
     * subclasses.
+    *
+    * @param ex
+    *   The exception to extract error information from
+    * @param lineOffset
+    *   Line offset to add to reported line numbers (for EIP-5 format)
+    * @param script
+    *   Optional original script source for improved column position detection
     */
-  private def extractCompilationError(ex: Throwable): CompilationError = {
+  private def extractCompilationError(
+      ex: Throwable,
+      lineOffset: Int = 0,
+      script: Option[String] = None
+  ): CompilationError = {
     val message = Option(ex.getMessage).getOrElse("Unknown compilation error")
 
     // Try to extract SourceContext from sigma exceptions using reflection
@@ -147,10 +160,19 @@ object Compiler extends LazyLogging {
       case Some(ctx) =>
         // Clean up the error message - extract just the meaningful part
         val cleanMessage = cleanErrorMessage(message)
+
+        // Adjust column for method call errors in chains
+        val adjustedColumn = adjustColumnForMethodCall(
+          message,
+          ctx.line + lineOffset,
+          ctx.column,
+          script
+        )
+
         CompilationError(
           message = cleanMessage,
-          line = Some(ctx.line),
-          column = Some(ctx.column)
+          line = Some(ctx.line + lineOffset),
+          column = Some(adjustedColumn)
         )
       case None =>
         // Fall back to regex-based extraction from error message
@@ -158,7 +180,7 @@ object Compiler extends LazyLogging {
         val cleanMessage = cleanErrorMessage(message)
         CompilationError(
           message = cleanMessage,
-          line = line,
+          line = line.map(_ + lineOffset),
           column = column
         )
     }
@@ -177,6 +199,119 @@ object Compiler extends LazyLogging {
     } catch {
       case _: NoSuchMethodException => None
       case _: Exception             => None
+    }
+  }
+
+  /** Calculate line offset for EIP-5 format contracts. The parser extracts the
+    * body after the `=` sign, so we need to find which line that starts on to
+    * adjust error positions back to the original source.
+    */
+  private def calculateEIP5LineOffset(script: String): Int = {
+    // Find the position of the `=` sign that starts the contract body
+    // The pattern is: @contract def name(params) = { body }
+    val contractDefPattern = """@contract\s+def\s+\w+\s*\([^)]*\)\s*=""".r
+
+    contractDefPattern.findFirstMatchIn(script) match {
+      case Some(m) =>
+        // Count newlines up to the `=` sign
+        val prefixBeforeBody = script.substring(0, m.end)
+        prefixBeforeBody.count(_ == '\n')
+      case None =>
+        // If we can't find the pattern, return 0 (no offset)
+        0
+    }
+  }
+
+  /** Adjust column position for method call errors in chained calls. When a
+    * method doesn't exist in a chain like `box.value.nonExistentMethod()`, the
+    * error points to the start of the chain, but we want to point to the actual
+    * failing method name. Also handles type mismatch errors in lambda
+    * expressions.
+    *
+    * @param message
+    *   The error message
+    * @param line
+    *   The line number where the error occurred
+    * @param column
+    *   The column number reported by the compiler
+    * @param script
+    *   The original script source
+    * @return
+    *   Adjusted column number
+    */
+  private def adjustColumnForMethodCall(
+      message: String,
+      line: Int,
+      column: Int,
+      script: Option[String]
+  ): Int = {
+    // Pattern to extract method name from error message like:
+    // "Cannot find method 'nonExistentMethod' in ..."
+    val methodNamePattern = """Cannot find method '(\w+)'""".r
+
+    // Pattern for type mismatch in Select (method call on chain)
+    // e.g., "Invalid argument type of application Apply(Select(...),filter,None)"
+    // We look for ,methodName,None) pattern which appears in the Select AST representation
+    val selectMethodPattern = """,(\w+),None\)""".r
+
+    methodNamePattern.findFirstMatchIn(message) match {
+      case Some(m) =>
+        val methodName = m.group(1)
+
+        // Get the source line if available
+        script
+          .flatMap { src =>
+            val lines = src.split("\n")
+            if (line > 0 && line <= lines.length) {
+              val sourceLine = lines(line - 1) // Convert to 0-based index
+
+              // Find the method name in the line
+              val methodIndex = sourceLine.indexOf(methodName)
+              if (methodIndex >= 0) {
+                // Return the column where the method name starts (1-based)
+                Some(methodIndex + 1)
+              } else {
+                None
+              }
+            } else {
+              None
+            }
+          }
+          .getOrElse(column) // Fall back to original column if we can't find it
+
+      case None =>
+        // Check for type mismatch errors in method calls like filter, map, etc.
+        selectMethodPattern.findFirstMatchIn(message) match {
+          case Some(m) =>
+            val methodName = m.group(1)
+
+            // Get the source line if available
+            script
+              .flatMap { src =>
+                val lines = src.split("\n")
+                if (line > 0 && line <= lines.length) {
+                  val sourceLine = lines(line - 1) // Convert to 0-based index
+
+                  // Find the method name in the line
+                  val methodIndex = sourceLine.indexOf(s".$methodName")
+                  if (methodIndex >= 0) {
+                    // Point to the method name after the dot
+                    Some(methodIndex + 2) // +1 for 1-based, +1 to skip the dot
+                  } else {
+                    None
+                  }
+                } else {
+                  None
+                }
+              }
+              .getOrElse(
+                column
+              ) // Fall back to original column if we can't find it
+
+          case None =>
+            // Not a recognized error pattern, return original column
+            column
+        }
     }
   }
 
