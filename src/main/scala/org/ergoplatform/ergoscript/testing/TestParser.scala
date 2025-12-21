@@ -2,7 +2,33 @@ package org.ergoplatform.ergoscript.testing
 
 import scala.util.matching.Regex
 import scala.util.{Try, Success, Failure}
+import scala.collection.mutable.ListBuffer
 import com.typesafe.scalalogging.LazyLogging
+
+/** Severity levels for test parse errors */
+sealed trait TestParseSeverity
+object TestParseSeverity {
+  case object Error extends TestParseSeverity
+  case object Warning extends TestParseSeverity
+}
+
+/** Represents a parsing error or warning in a test file.
+  *
+  * @param message
+  *   Human-readable error message
+  * @param line
+  *   Line number (1-based)
+  * @param column
+  *   Column number (1-based)
+  * @param severity
+  *   Error or Warning
+  */
+case class TestParseError(
+    message: String,
+    line: Int,
+    column: Int,
+    severity: TestParseSeverity
+)
 
 /** Parser for @test blocks in ErgoScript files.
   *
@@ -91,6 +117,97 @@ object TestParser extends LazyLogging {
         }
       }
       .toList
+  }
+
+  /** Validate test file structure and return any parsing errors/warnings. This
+    * method is used by the LSP to provide diagnostics for test files.
+    *
+    * @param source
+    *   Test file source code
+    * @param filePath
+    *   Source file path (for error reporting)
+    * @return
+    *   List of parse errors and warnings
+    */
+  def validateTests(source: String, filePath: String): List[TestParseError] = {
+    val errors = ListBuffer[TestParseError]()
+
+    // Check if file has any imports (which is valid)
+    val hasImports = source.contains("#import")
+
+    // Check for @test blocks
+    val testMatches = testStartPattern.findAllMatchIn(source).toList
+
+    if (testMatches.isEmpty && !hasImports) {
+      // Only warn if there are no imports either (could be an empty test file)
+      errors += TestParseError(
+        message = "No @test blocks found in test file",
+        line = 1,
+        column = 1,
+        severity = TestParseSeverity.Warning
+      )
+    }
+
+    // Validate each @test block
+    testMatches.foreach { m =>
+      val testName = m.group(1)
+      val testStart = m.end
+      val line = source.substring(0, m.start).count(_ == '\n') + 1
+      val column = m.start - source.lastIndexOf('\n', m.start)
+
+      // Check for balanced braces
+      extractBalancedBraces(source, testStart) match {
+        case None =>
+          errors += TestParseError(
+            message =
+              s"Unbalanced braces in test '$testName' - missing closing '}'",
+            line = line,
+            column = column,
+            severity = TestParseSeverity.Error
+          )
+
+        case Some((body, _)) =>
+          // Check for @context block
+          if (!body.contains("@context")) {
+            errors += TestParseError(
+              message = s"Missing @context block in test '$testName'",
+              line = line,
+              column = column,
+              severity = TestParseSeverity.Warning
+            )
+          }
+
+          // Check for @assert statements
+          if (!body.contains("@assert")) {
+            errors += TestParseError(
+              message = s"No @assert statements in test '$testName'",
+              line = line,
+              column = column,
+              severity = TestParseSeverity.Warning
+            )
+          }
+
+          // Validate @context block structure if present
+          contextStartPattern.findFirstMatchIn(body).foreach { contextMatch =>
+            val contextStart = contextMatch.end
+            extractBalancedBraces(body, contextStart) match {
+              case None =>
+                val contextLine =
+                  line + body.substring(0, contextMatch.start).count(_ == '\n')
+                errors += TestParseError(
+                  message =
+                    s"Unbalanced braces in @context block of test '$testName'",
+                  line = contextLine,
+                  column = 1,
+                  severity = TestParseSeverity.Error
+                )
+              case Some(_) => // Valid context block
+            }
+          }
+      }
+    }
+
+    errors.toList
   }
 
   /** Extract content within balanced braces starting from a position.

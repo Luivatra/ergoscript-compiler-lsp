@@ -390,10 +390,65 @@ class SimpleLspServer(
     val isLibraryFile = filePath.exists(_.contains("/lib/")) ||
       isLibraryContent(text)
 
-    // Skip compilation diagnostics for library files - they're not standalone contracts
-    val errorDiagnostics = if (isLibraryFile) {
-      logger.debug(s"Skipping compilation diagnostics for library file: $uri")
-      List.empty[Diagnostic]
+    // Check if this is a test file (.test.es extension or contains @test annotations)
+    val isTestFile = filePath.exists(_.endsWith(".test.es")) ||
+      text.contains("@test")
+
+    // Generate diagnostics based on file type
+    val errorDiagnostics = if (isTestFile) {
+      // Validate test file structure
+      import org.ergoplatform.ergoscript.testing.{
+        TestParser,
+        TestParseError,
+        TestParseSeverity
+      }
+      logger.debug(s"Validating test file: $uri")
+
+      TestParser.validateTests(text, filePath.getOrElse("")).map { err =>
+        val severity = err.severity match {
+          case TestParseSeverity.Error   => 1 // LSP Error
+          case TestParseSeverity.Warning => 2 // LSP Warning
+        }
+        Diagnostic(
+          range = Range(
+            start = Position(err.line - 1, err.column - 1),
+            end = Position(err.line - 1, err.column + 10)
+          ),
+          severity = Some(severity),
+          code = None,
+          source = Some("ergoscript"),
+          message = err.message
+        )
+      }
+    } else if (isLibraryFile) {
+      // Validate library file by wrapping in synthetic contract
+      logger.debug(s"Validating library file: $uri")
+
+      Compiler.validateLibrary(text, filePath, workspaceRoot) match {
+        case Right(_) =>
+          logger.debug("Library validation successful")
+          List.empty[Diagnostic]
+        case Left(err) =>
+          logger.debug(s"Library validation error: ${err.message}")
+          List(
+            Diagnostic(
+              range = Range(
+                start = Position(
+                  err.line.getOrElse(1) - 1,
+                  err.column.getOrElse(1) - 1
+                ),
+                end = Position(
+                  err.line.getOrElse(1) - 1,
+                  err.column.getOrElse(1) + 10
+                )
+              ),
+              severity = Some(1), // Error
+              code = None,
+              source = Some("ergoscript"),
+              message = err.message
+            )
+          )
+      }
     } else {
       // Compile the script to get errors (with import support)
       Compiler.compileWithImports(

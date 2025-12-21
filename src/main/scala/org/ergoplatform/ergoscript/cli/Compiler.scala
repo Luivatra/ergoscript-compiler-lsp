@@ -162,6 +162,53 @@ object Compiler extends LazyLogging {
     }
   }
 
+  /** Validate library file code by wrapping it in a synthetic contract. This
+    * allows type-checking of library functions without requiring a top-level
+    * contract expression.
+    *
+    * @param libraryCode
+    *   The library source code (def/val definitions)
+    * @param filePath
+    *   Path to the library file (for resolving imports)
+    * @param workspaceRoot
+    *   Workspace root directory
+    * @return
+    *   Right(()) if valid, Left(error) if there are issues
+    */
+  def validateLibrary(
+      libraryCode: String,
+      filePath: Option[String],
+      workspaceRoot: Option[String]
+  ): Either[CompilationError, Unit] = {
+    // Count lines before the library code in the wrapper
+    val wrapperPrefix = "@contract def _synthetic_validator_() = {\n"
+    val wrapperPrefixLines = wrapperPrefix.count(_ == '\n')
+
+    // Wrap library in synthetic contract
+    val wrapped = s"$wrapperPrefix  $libraryCode\n  true\n}"
+
+    // Compile and discard result - we only want errors
+    compileWithImports(
+      wrapped,
+      "_validator",
+      "",
+      filePath,
+      workspaceRoot
+    ) match {
+      case Right(_)  => Right(())
+      case Left(err) =>
+        // Adjust line numbers (subtract synthetic wrapper lines)
+        val adjustedLine = err.line.map(_ - wrapperPrefixLines)
+        Left(
+          CompilationError(
+            message = err.message,
+            line = adjustedLine,
+            column = err.column
+          )
+        )
+    }
+  }
+
   /** Compile using SigmaTemplateCompiler for EIP-5 template support. The script
     * should follow EIP-5 contract template syntax with @contract decorator.
     */
