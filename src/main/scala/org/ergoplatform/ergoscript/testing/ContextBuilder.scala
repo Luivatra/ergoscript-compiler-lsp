@@ -71,7 +71,7 @@ object ContextBuilder extends LazyLogging {
       .getOrElse(buildDefaultPreHeader(mockContext.height.toInt))
 
     // Create ErgoLikeContext
-    new ErgoLikeContext(
+    val baseContext = new ErgoLikeContext(
       lastBlockUtxoRoot = AvlTreeData.dummy,
       headers = Colls.emptyColl[Header],
       preHeader = preHeaderValue,
@@ -81,10 +81,19 @@ object ContextBuilder extends LazyLogging {
       selfIndex = selfIndex,
       extension = ContextExtension.empty,
       validationSettings = ValidationRules.currentSettings,
-      costLimit = Long.MaxValue,
+      costLimit = 1000000L, // Reasonable cost limit that fits in Int
       initCost = 0L,
-      activatedScriptVersion = 2.toByte
+      activatedScriptVersion = 3.toByte // Support ErgoTree v3
     )
+
+    // Set the ErgoTree version from the contract if available
+    val contextWithVersion = contractTree match {
+      case Some(tree) => baseContext.withErgoTreeVersion(tree.version)
+      case None =>
+        baseContext.withErgoTreeVersion(3.toByte) // Default to version 3
+    }
+
+    contextWithVersion
   }
 
   /** Convert MockBox to ErgoBox.

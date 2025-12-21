@@ -5,6 +5,7 @@ import sigma.ast.ErgoTree
 import sigma.compiler.SigmaCompiler
 import sigma.compiler.ir.IRContext
 import org.ergoplatform.ErgoLikeContext
+import sigmastate.interpreter.CErgoTreeEvaluator
 
 import java.nio.file.{Files, Path}
 import scala.util.{Try, Success, Failure}
@@ -274,29 +275,50 @@ class TestRunner extends LazyLogging {
       val expectedValue = assertion.expected.getOrElse("true").toLowerCase
       val expectedBool = expectedValue == "true"
 
-      // Simplified evaluation - just assume the contract compiles successfully
-      // Full evaluation would require CErgoTreeEvaluator from sigma-state
-      // which may have API changes in the current version
-      val passed =
-        true // Placeholder: contracts that compile are considered valid
+      // Actually evaluate the contract with the context
+      import sigmastate.interpreter.CErgoTreeEvaluator
+      import sigma.VersionContext
 
-      AssertionResult(
-        assertion = assertion,
-        passed = passed,
-        message = if (passed) {
-          s"✓ ${assertion.description.getOrElse(assertion.expression)}"
-        } else {
-          s"✗ ${assertion.description.getOrElse(assertion.expression)}: expected $expectedValue"
+      // Set the global version context to match the contract version
+      val treeVersion = contractTree.version
+      VersionContext.withVersions(treeVersion, treeVersion) {
+        val reductionResult = CErgoTreeEvaluator.evalToCrypto(
+          context,
+          contractTree,
+          CErgoTreeEvaluator.DefaultEvalSettings
+        )
+
+        // Check if evaluation result matches expected
+        import sigma.data.TrivialProp
+        val actualResult = reductionResult.value match {
+          case TrivialProp.TrueProp  => true
+          case TrivialProp.FalseProp => false
+          case _ =>
+            true // SigmaProp that needs proving - consider as potentially true for now
         }
-      )
+
+        val passed = actualResult == expectedBool
+
+        AssertionResult(
+          assertion = assertion,
+          passed = passed,
+          message = if (passed) {
+            s"✓ ${assertion.description.getOrElse(assertion.expression)}"
+          } else {
+            s"✗ ${assertion.description.getOrElse(assertion.expression)}: expected $expectedValue, got $actualResult"
+          }
+        )
+      }
     } match {
       case Success(result) => result
-      case Failure(ex) =>
+      case Failure(ex)     =>
+        // Print stack trace for debugging
+        ex.printStackTrace()
         AssertionResult(
           assertion = assertion,
           passed = false,
           message =
-            s"✗ ${assertion.description.getOrElse(assertion.expression)}: ${ex.getMessage}"
+            s"✗ ${assertion.description.getOrElse(assertion.expression)}: ${ex.getClass.getSimpleName}: ${ex.getMessage}"
         )
     }
   }
