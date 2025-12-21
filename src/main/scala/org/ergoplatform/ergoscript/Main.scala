@@ -11,8 +11,9 @@ object Main {
     }
 
     args.head match {
-      case "compile" =>
-        CliApp.run(args.tail)
+      case "compile" | "test" | "init" | "validate" =>
+        // Use new Commands interface with full feature support
+        org.ergoplatform.ergoscript.cli.Commands.main(args)
 
       case "lsp" | "server" =>
         // Use simple JSON-RPC implementation to avoid lsp4j annotation issues
@@ -42,28 +43,51 @@ object Main {
     println("""ErgoScript Compiler and Language Server
         |
         |Usage:
-        |  ergoscript-compiler compile [options]    Compile ErgoScript to EIP-5 JSON
-        |  ergoscript-compiler lsp                  Start Language Server (LSP mode)
-        |  ergoscript-compiler server               Start Language Server (alias for lsp)
-        |  ergoscript-compiler --help               Show this help message
-        |  ergoscript-compiler --version            Show version information
+        |  ergoscript-compiler <command> [options]
         |
-        |Compile Options:
-        |  -i, --input <file>                       Input ErgoScript file path
-        |  -s, --script <code>                      Inline ErgoScript code
-        |  -o, --output <file>                      Output JSON file (optional, defaults to stdout)
-        |  -n, --name <name>                        Contract name (default: UnnamedContract)
-        |  -d, --description <text>                 Contract description
-        |  --network <mainnet|testnet>              Network type (default: mainnet)
-        |  --tree-version <byte>                    ErgoTree version
-        |  --help                                   Show compile help
+        |Commands:
+        |  compile                                  Compile ErgoScript to EIP-5 JSON
+        |  test                                     Run ErgoScript tests
+        |  init                                     Initialize a new ErgoScript project
+        |  validate                                 Validate project configuration
+        |  lsp                                      Start Language Server (LSP mode)
+        |  server                                   Start Language Server (alias for lsp)
+        |  --help                                   Show this help message
+        |  --version                                Show version information
+        |
+        |Compile Command:
+        |  ergoscript-compiler compile [options]
+        |  Options:
+        |    -i, --input <file>                     Input ErgoScript file path
+        |    -s, --script <code>                    Inline ErgoScript code
+        |    -o, --output <file>                    Output JSON file (optional, defaults to stdout)
+        |    -n, --name <name>                      Contract name (default: UnnamedContract)
+        |    -d, --description <text>               Contract description
+        |    --network <mainnet|testnet>            Network type (default: mainnet)
+        |    --tree-version <byte>                  ErgoTree version
+        |
+        |Test Command:
+        |  ergoscript-compiler test [files...] [options]
+        |  Options:
+        |    --verbose, -v                          Show detailed output
+        |    --filter <pattern>                     Filter tests by name pattern
+        |    --network <mainnet|testnet>            Network type (default: mainnet)
+        |
+        |Init Command:
+        |  ergoscript-compiler init [options]
+        |  Options:
+        |    --name <project-name>                  Project name
+        |    --description <text>                   Project description
         |
         |Examples:
         |  # Compile from file
         |  ergoscript-compiler compile -i contract.es -o contract.json -n "MyContract"
         |
-        |  # Compile inline script
-        |  ergoscript-compiler compile -s "sigmaProp(HEIGHT > 100)" -n "SimpleHeight"
+        |  # Run tests
+        |  ergoscript-compiler test tests/main.test.es --verbose
+        |
+        |  # Initialize a new project
+        |  ergoscript-compiler init --name my-project
         |
         |  # Start LSP server
         |  ergoscript-compiler lsp

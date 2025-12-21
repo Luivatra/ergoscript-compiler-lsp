@@ -1,0 +1,36 @@
+{
+  "name" : "test-project",
+  "version" : "1.0.0",
+  "description" : "An ErgoScript project",
+  "ergoscript" : {
+    "version" : "6.0",
+    "network" : "mainnet"
+  },
+  "directories" : {
+    "source" : "src",
+    "lib" : "lib",
+    "output" : "build",
+    "tests" : "tests"
+  },
+  "constants" : {
+    "minBoxValue" : {
+      "constantType" : "Long",
+      "value" : "1000000",
+      "description" : "Minimum box value in nanoErgs"
+    }
+  },
+  "compile" : {
+    "contracts" : [
+      {
+        "name" : "MainContract",
+        "source" : "src/main.es",
+        "output" : "main.json"
+      }
+    ]
+  },
+  "test" : {
+    "enabled" : true,
+    "parallel" : false,
+    "timeout" : 30000
+  }
+}

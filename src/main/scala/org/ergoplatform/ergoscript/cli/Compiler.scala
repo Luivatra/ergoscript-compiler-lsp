@@ -14,7 +14,7 @@ import scala.util.{Try, Success, Failure}
 
 case class CompilationResult(
     ergoTree: ErgoTree,
-    template: ContractTemplate
+    template: Option[ContractTemplate] = None
 )
 
 case class CompilationError(
@@ -39,11 +39,126 @@ object Compiler extends LazyLogging {
       networkPrefix: Byte = 0x00, // Mainnet
       treeVersion: Byte = ErgoTree.VersionFlag
   ): Either[CompilationError, CompilationResult] = {
+    compileWithImports(
+      script,
+      name,
+      description,
+      None,
+      None,
+      networkPrefix,
+      treeVersion
+    )
+  }
+
+  /** Compile ErgoScript with import resolution support.
+    *
+    * @param script
+    *   The ErgoScript source code
+    * @param name
+    *   Contract name
+    * @param description
+    *   Contract description
+    * @param filePath
+    *   Path to the current file (for resolving relative imports)
+    * @param workspaceRoot
+    *   Workspace root directory (for resolving imports)
+    * @param networkPrefix
+    *   Network prefix (mainnet/testnet)
+    * @param treeVersion
+    *   ErgoTree version
+    * @return
+    *   Compilation result or error
+    */
+  def compileWithImports(
+      script: String,
+      name: String,
+      description: String,
+      filePath: Option[String],
+      workspaceRoot: Option[String],
+      networkPrefix: Byte = 0x00,
+      treeVersion: Byte = ErgoTree.VersionFlag
+  ): Either[CompilationError, CompilationResult] = {
+    import org.ergoplatform.ergoscript.lsp.imports.ImportResolver
+    import org.ergoplatform.ergoscript.project.{
+      ProjectConfigParser,
+      ConstantSubstitution
+    }
+    import java.nio.file.Paths
+
+    // Try to load project configuration if workspace root is available
+    val projectConfig = workspaceRoot.flatMap { root =>
+      ProjectConfigParser.findAndParse(Paths.get(root))
+    }
+
+    // Apply constant substitution if project config exists
+    val scriptWithConstants = projectConfig match {
+      case Some(config) =>
+        ConstantSubstitution.substitute(script, config.constants) match {
+          case Right(substituted) => substituted
+          case Left(error) =>
+            return Left(
+              CompilationError(
+                message = s"Constant substitution error: $error",
+                line = None,
+                column = None
+              )
+            )
+        }
+      case None => script
+    }
+
+    // Expand imports
+    logger.debug(
+      s"Expanding imports for script with filePath=$filePath, workspaceRoot=$workspaceRoot"
+    )
+    logger.debug(
+      s"Script before import expansion: ${scriptWithConstants.take(100)}"
+    )
+    val importResult =
+      ImportResolver.expandImports(scriptWithConstants, filePath, workspaceRoot)
+    logger.debug(
+      s"Expanded script: ${importResult.expandedCode.code.take(100)}"
+    )
+
+    // Check for import errors
+    if (importResult.errors.nonEmpty) {
+      return Left(
+        CompilationError(
+          message = s"Import errors: ${importResult.errors.mkString("; ")}",
+          line = None,
+          column = None
+        )
+      )
+    }
+
+    // Get the expanded code and source map
+    val expandedCode = importResult.expandedCode
+    val expandedScript = expandedCode.code
+
+    // Use network prefix from project config if available
+    val finalNetworkPrefix = projectConfig
+      .map(_.ergoscript.networkPrefix)
+      .getOrElse(networkPrefix)
+
     // Check if script contains EIP-5 annotations
-    if (script.contains("@contract") || script.contains("@param")) {
-      compileTemplate(script, networkPrefix, treeVersion)
+    if (
+      expandedScript.contains("@contract") || expandedScript.contains("@param")
+    ) {
+      compileTemplate(
+        expandedScript,
+        finalNetworkPrefix,
+        treeVersion,
+        Some(expandedCode)
+      )
     } else {
-      compileStandard(script, name, description, networkPrefix, treeVersion)
+      compileStandard(
+        expandedScript,
+        name,
+        description,
+        finalNetworkPrefix,
+        treeVersion,
+        Some(expandedCode)
+      )
     }
   }
 
@@ -53,26 +168,61 @@ object Compiler extends LazyLogging {
   private def compileTemplate(
       script: String,
       networkPrefix: Byte,
-      treeVersion: Byte
+      treeVersion: Byte,
+      sourceMap: Option[org.ergoplatform.ergoscript.lsp.imports.ExpandedCode] =
+        None
   ): Either[CompilationError, CompilationResult] = {
+    // For templates, inline library functions into the template body
+    val (processedScript, adjustedSourceMap) =
+      if (script.contains("@contract")) {
+        val inlined = inlineLibraryFunctionsIntoTemplate(script)
+        val adjusted =
+          sourceMap.map(sm => adjustSourceMapForInlining(script, inlined, sm))
+        (inlined, adjusted)
+      } else {
+        (script, sourceMap)
+      }
+
     Try {
       val templateCompiler = SigmaTemplateCompiler(networkPrefix)
-      val template = templateCompiler.compile(script)
+      val template = templateCompiler.compile(processedScript)
 
-      // Build ErgoTree from the template's expression tree (which is a SigmaProp)
-      val ergoTree = ErgoTree.fromProposition(
-        ErgoTree.HeaderType @@ treeVersion,
-        template.expressionTree
-      )
+      // For templates, we create placeholder constants for parameters
+      // This allows the template to be stored and later bound with actual values
+      import sigma.ast._
+      val paramConstants = template.parameters
+        .zip(template.constTypes)
+        .map { case (param, constType) =>
+          // Create a placeholder constant of the appropriate type
+          val constant: Constant[SType] = constType match {
+            case SInt  => IntConstant(0).asInstanceOf[Constant[SType]]
+            case SLong => LongConstant(0L).asInstanceOf[Constant[SType]]
+            case SBoolean =>
+              BooleanConstant(false).asInstanceOf[Constant[SType]]
+            case _ =>
+              IntConstant(0).asInstanceOf[Constant[SType]] // Default fallback
+          }
+          param.name -> constant
+        }
+        .toMap
 
-      CompilationResult(ergoTree, template)
+      val ergoTree = template.applyTemplate(Some(treeVersion), paramConstants)
+
+      CompilationResult(ergoTree, Some(template))
     } match {
       case Success(result) => Right(result)
       case Failure(ex) =>
         logger.error("Template compilation failed", ex)
         // Calculate line offset for EIP-5 format to adjust error positions
-        val lineOffset = calculateEIP5LineOffset(script)
-        Left(extractCompilationError(ex, lineOffset, Some(script)))
+        val lineOffset = calculateEIP5LineOffset(processedScript)
+        Left(
+          extractCompilationError(
+            ex,
+            lineOffset,
+            Some(processedScript),
+            adjustedSourceMap
+          )
+        )
     }
   }
 
@@ -83,7 +233,9 @@ object Compiler extends LazyLogging {
       name: String,
       description: String,
       networkPrefix: Byte,
-      treeVersion: Byte
+      treeVersion: Byte,
+      sourceMap: Option[org.ergoplatform.ergoscript.lsp.imports.ExpandedCode] =
+        None
   ): Either[CompilationError, CompilationResult] = {
     Try {
       // Use SigmaCompiler to compile ErgoScript
@@ -117,19 +269,277 @@ object Compiler extends LazyLogging {
         expressionTree = value.toSigmaProp
       )
 
-      CompilationResult(ergoTree, template)
+      CompilationResult(ergoTree, Some(template))
 
     } match {
       case Success(result) => Right(result)
       case Failure(ex) =>
         logger.error("Compilation failed", ex)
-        Left(extractCompilationError(ex, 0, Some(script)))
+        Left(extractCompilationError(ex, 0, Some(script), sourceMap))
+    }
+  }
+
+  /** Adjust source map after inlining library functions into template body.
+    * This accounts for the line number shifts caused by moving library
+    * functions.
+    *
+    * @param originalScript
+    *   The script before inlining
+    * @param inlinedScript
+    *   The script after inlining
+    * @param sourceMap
+    *   The original source map
+    * @return
+    *   Adjusted source map
+    */
+  private def adjustSourceMapForInlining(
+      originalScript: String,
+      inlinedScript: String,
+      sourceMap: org.ergoplatform.ergoscript.lsp.imports.ExpandedCode
+  ): org.ergoplatform.ergoscript.lsp.imports.ExpandedCode = {
+    import org.ergoplatform.ergoscript.lsp.imports.SourceLocation
+
+    // Find where library functions were in the original
+    val contractIndex = originalScript.indexOf("@contract")
+    if (contractIndex == -1) {
+      return sourceMap
+    }
+
+    val beforeContract = originalScript.substring(0, contractIndex)
+    val libraryFunctions = extractLibraryFunctions(beforeContract.trim)
+
+    if (libraryFunctions.isEmpty) {
+      return sourceMap
+    }
+
+    // Count lines in library functions
+    val libraryLineCount = libraryFunctions.map(_.count(_ == '\n') + 1).sum
+
+    // Find the template body opening brace line in the inlined script
+    val templateBodyPattern = """@contract\s+def\s+\w+\s*\([^)]*\)\s*=\s*\{""".r
+    val openBraceLineInInlined =
+      templateBodyPattern.findFirstMatchIn(inlinedScript) match {
+        case Some(m) =>
+          inlinedScript.substring(0, m.end).count(_ == '\n') + 1
+        case None =>
+          return sourceMap
+      }
+
+    // Find the template body opening brace line in the original script
+    val openBraceLineInOriginal =
+      templateBodyPattern.findFirstMatchIn(originalScript) match {
+        case Some(m) =>
+          originalScript.substring(0, m.end).count(_ == '\n') + 1
+        case None =>
+          return sourceMap
+      }
+
+    // Count lines before @contract that were removed
+    val linesBeforeContractOriginal =
+      originalScript.substring(0, contractIndex).count(_ == '\n') + 1
+    val linesBeforeContractInlined = inlinedScript
+      .substring(0, inlinedScript.indexOf("@contract"))
+      .count(_ == '\n') + 1
+    val removedLines = linesBeforeContractOriginal - linesBeforeContractInlined
+
+    // Build new source map
+    val newMappings = scala.collection.mutable.Map[Int, SourceLocation]()
+
+    inlinedScript.split("\n").indices.foreach { idx =>
+      val inlinedLine = idx + 1
+
+      if (inlinedLine <= linesBeforeContractInlined) {
+        // Lines before @contract - map directly but adjust for removed library functions
+        val originalLine = inlinedLine + removedLines
+        sourceMap.getOriginalLocation(originalLine).foreach { loc =>
+          newMappings(inlinedLine) = loc
+        }
+      } else if (inlinedLine <= openBraceLineInInlined) {
+        // @contract declaration line - map directly
+        val originalLine = inlinedLine + removedLines
+        sourceMap.getOriginalLocation(originalLine).foreach { loc =>
+          newMappings(inlinedLine) = loc
+        }
+      } else if (inlinedLine <= openBraceLineInInlined + libraryLineCount) {
+        // Library functions that were moved - map back to their original location
+        val libraryOffset = inlinedLine - openBraceLineInInlined - 1
+        val originalLine =
+          linesBeforeContractOriginal - removedLines + libraryOffset + 1
+        sourceMap.getOriginalLocation(originalLine).foreach { loc =>
+          newMappings(inlinedLine) = loc
+        }
+      } else {
+        // Original template body - don't shift, map to same relative position as before
+        val offsetFromBrace =
+          inlinedLine - openBraceLineInInlined - libraryLineCount
+        val originalLine = openBraceLineInOriginal + offsetFromBrace
+        sourceMap.getOriginalLocation(originalLine).foreach { loc =>
+          newMappings(inlinedLine) = loc
+        }
+      }
+    }
+
+    org.ergoplatform.ergoscript.lsp.imports.SourceMap(
+      inlinedScript,
+      newMappings.toMap
+    )
+  }
+
+  /** Inline library functions into template body. For @contract templates that
+    * have library function definitions before the @contract annotation, this
+    * method moves those definitions into the template body (after the opening
+    * brace). This allows templates to use imported helper functions.
+    *
+    * @param script
+    *   The script with potential library functions before @contract
+    * @return
+    *   Script with library functions inlined into template body
+    */
+  private def inlineLibraryFunctionsIntoTemplate(script: String): String = {
+    // Find the @contract line
+    val contractIndex = script.indexOf("@contract")
+    if (contractIndex == -1) {
+      return script
+    }
+
+    // Extract everything before @contract
+    val beforeContract = script.substring(0, contractIndex).trim
+
+    // Check if there are any def or val definitions
+    if (!beforeContract.contains("def ") && !beforeContract.contains("val ")) {
+      return script
+    }
+
+    // Extract library functions using balanced brace matching
+    // We need to handle: def name(...) = { ... } with proper brace counting
+    val libraryFunctions = extractLibraryFunctions(beforeContract)
+
+    // If no library functions found, return original script
+    if (libraryFunctions.isEmpty) {
+      return script
+    }
+
+    // Find the opening brace of the template body
+    // Pattern: @contract def name(...) = {
+    // Need to handle parameters with default values like (minHeight: Int = 100)
+    val templateBodyPattern = """@contract\s+def\s+\w+\s*\([^)]*\)\s*=\s*\{""".r
+
+    templateBodyPattern.findFirstMatchIn(script) match {
+      case Some(m) =>
+        val openBraceIndex = m.end - 1 // Position of the '{'
+
+        // Remove library functions from before @contract, keeping only comments
+        val cleanedBefore =
+          removeLibraryFunctions(beforeContract, libraryFunctions).trim
+
+        // Build the new script:
+        // 1. Cleaned before content (comments and whitespace)
+        // 2. @contract line and opening brace
+        // 3. Library functions indented
+        // 4. Rest of the template body
+        val afterOpenBrace = script.substring(openBraceIndex + 1)
+
+        val indentedLibraryFunctions =
+          libraryFunctions.map(func => s"  $func").mkString("\n", "\n", "\n")
+
+        val result = if (cleanedBefore.nonEmpty) {
+          s"$cleanedBefore\n${script.substring(contractIndex, openBraceIndex + 1)}$indentedLibraryFunctions$afterOpenBrace"
+        } else {
+          s"${script.substring(contractIndex, openBraceIndex + 1)}$indentedLibraryFunctions$afterOpenBrace"
+        }
+
+        result
+
+      case None =>
+        // Could not find template body pattern, return original
+        script
+    }
+  }
+
+  /** Extract library functions (def and val) from text using balanced brace
+    * matching.
+    */
+  private def extractLibraryFunctions(text: String): List[String] = {
+    val functions = scala.collection.mutable.ListBuffer[String]()
+    var i = 0
+    val chars = text.toCharArray
+
+    while (i < chars.length) {
+      // Skip whitespace
+      while (i < chars.length && chars(i).isWhitespace) i += 1
+
+      if (i >= chars.length) return functions.toList
+
+      // Check if we're at a def or val
+      if (
+        text
+          .substring(i)
+          .startsWith("def ") || text.substring(i).startsWith("val ")
+      ) {
+        val start = i
+
+        // Find the '=' sign
+        while (i < chars.length && chars(i) != '=') i += 1
+
+        if (i >= chars.length) return functions.toList
+
+        i += 1 // Skip '='
+
+        // Skip whitespace after '='
+        while (i < chars.length && chars(i).isWhitespace) i += 1
+
+        if (i >= chars.length) return functions.toList
+
+        // Check if it's a brace-enclosed expression
+        if (chars(i) == '{') {
+          // Find matching closing brace
+          var braceCount = 1
+          i += 1
+          while (i < chars.length && braceCount > 0) {
+            if (chars(i) == '{') braceCount += 1
+            else if (chars(i) == '}') braceCount -= 1
+            i += 1
+          }
+
+          functions += text.substring(start, i).trim
+        } else {
+          // Single expression until newline or semicolon
+          while (i < chars.length && chars(i) != '\n' && chars(i) != ';') i += 1
+          functions += text.substring(start, i).trim
+        }
+      } else if (text.substring(i).startsWith("//")) {
+        // Skip comment line
+        while (i < chars.length && chars(i) != '\n') i += 1
+      } else if (text.substring(i).startsWith("/*")) {
+        // Skip block comment
+        i += 2
+        while (
+          i < chars.length - 1 && !(chars(i) == '*' && chars(i + 1) == '/')
+        ) i += 1
+        i += 2
+      } else {
+        // Skip unknown character
+        i += 1
+      }
+    }
+
+    functions.toList
+  }
+
+  /** Remove library functions from text, keeping comments.
+    */
+  private def removeLibraryFunctions(
+      text: String,
+      functions: List[String]
+  ): String = {
+    functions.foldLeft(text) { (t, func) =>
+      t.replace(func, "")
     }
   }
 
   /** Extract structured error information from various exception types. Uses
     * reflection to access the `source` field from SigmaException and its
-    * subclasses.
+    * subclasses. Maps error positions back to original source using source map.
     *
     * @param ex
     *   The exception to extract error information from
@@ -137,11 +547,15 @@ object Compiler extends LazyLogging {
     *   Line offset to add to reported line numbers (for EIP-5 format)
     * @param script
     *   Optional original script source for improved column position detection
+    * @param sourceMap
+    *   Optional source map for mapping expanded code positions to original
     */
   private def extractCompilationError(
       ex: Throwable,
       lineOffset: Int = 0,
-      script: Option[String] = None
+      script: Option[String] = None,
+      sourceMap: Option[org.ergoplatform.ergoscript.lsp.imports.ExpandedCode] =
+        None
   ): CompilationError = {
     val message = Option(ex.getMessage).getOrElse("Unknown compilation error")
 
@@ -169,19 +583,74 @@ object Compiler extends LazyLogging {
           script
         )
 
-        CompilationError(
-          message = cleanMessage,
-          line = Some(ctx.line + lineOffset),
-          column = Some(adjustedColumn)
-        )
+        val expandedLine = ctx.line + lineOffset
+        val expandedColumn = adjustedColumn
+
+        // Map back to original source if we have a source map
+        sourceMap match {
+          case Some(sm) =>
+            sm.getOriginalLocation(expandedLine, expandedColumn) match {
+              case Some(originalLoc) =>
+                // Build error message with original file info if different
+                val filePrefix = if (originalLoc.originalFile != "<unknown>") {
+                  s"${originalLoc.originalFile}: "
+                } else {
+                  ""
+                }
+
+                CompilationError(
+                  message = s"$filePrefix$cleanMessage",
+                  line = Some(originalLoc.originalLine),
+                  column = Some(originalLoc.originalColumn)
+                )
+              case None =>
+                // No mapping found, use expanded position
+                CompilationError(
+                  message = cleanMessage,
+                  line = Some(expandedLine),
+                  column = Some(expandedColumn)
+                )
+            }
+          case None =>
+            // No source map, use expanded position
+            CompilationError(
+              message = cleanMessage,
+              line = Some(expandedLine),
+              column = Some(expandedColumn)
+            )
+        }
       case None =>
         // Fall back to regex-based extraction from error message
         val (line, column) = extractLineColumnFromMessage(message)
         val cleanMessage = cleanErrorMessage(message)
+
+        // Try to map if we have both line and source map
+        val (finalLine, finalColumn, finalMessage) = (line, sourceMap) match {
+          case (Some(l), Some(sm)) =>
+            val expandedLine = l + lineOffset
+            sm.getOriginalLocation(expandedLine, column.getOrElse(1)) match {
+              case Some(originalLoc) =>
+                val filePrefix = if (originalLoc.originalFile != "<unknown>") {
+                  s"${originalLoc.originalFile}: "
+                } else {
+                  ""
+                }
+                (
+                  Some(originalLoc.originalLine),
+                  Some(originalLoc.originalColumn),
+                  s"$filePrefix$cleanMessage"
+                )
+              case None =>
+                (Some(expandedLine), column, cleanMessage)
+            }
+          case _ =>
+            (line.map(_ + lineOffset), column, cleanMessage)
+        }
+
         CompilationError(
-          message = cleanMessage,
-          line = line.map(_ + lineOffset),
-          column = column
+          message = finalMessage,
+          line = finalLine,
+          column = finalColumn
         )
     }
   }

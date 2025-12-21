@@ -254,6 +254,8 @@ class SimpleLspServer(
   private def handleCompletion(
       request: RequestMessage
   ): Option[ResponseMessage] = {
+    import org.ergoplatform.ergoscript.lsp.imports.ImportResolver
+
     request.params.flatMap(_.as[CompletionParams].toOption) match {
       case Some(params) =>
         val uri = params.textDocument.uri
@@ -267,10 +269,26 @@ class SimpleLspServer(
         // Get the document text
         documents.get(uri) match {
           case Some(documentText) =>
+            // Expand imports to get the full code with imported symbols
+            val filePath = uriToFilePath(uri)
+            val workspaceRoot = ImportResolver.getWorkspaceRootFromUri(uri)
+            val importResult = ImportResolver.expandImports(
+              documentText,
+              filePath,
+              workspaceRoot
+            )
+
+            // Use the expanded text for completion (so imported symbols are available)
+            val textForCompletion = if (importResult.errors.isEmpty) {
+              importResult.expandedCode.code
+            } else {
+              documentText // Fall back to original if imports fail
+            }
+
             // Use the completion provider to generate completions
             val result =
               completionProvider.complete(
-                documentText,
+                textForCompletion,
                 position,
                 triggerCharacter
               )
@@ -300,6 +318,8 @@ class SimpleLspServer(
   /** Handle textDocument/hover request.
     */
   private def handleHover(request: RequestMessage): Option[ResponseMessage] = {
+    import org.ergoplatform.ergoscript.lsp.imports.ImportResolver
+
     request.params.flatMap(_.as[HoverParams].toOption) match {
       case Some(params) =>
         val uri = params.textDocument.uri
@@ -312,8 +332,24 @@ class SimpleLspServer(
         // Get the document text
         documents.get(uri) match {
           case Some(documentText) =>
+            // Expand imports to get the full code with imported symbols
+            val filePath = uriToFilePath(uri)
+            val workspaceRoot = ImportResolver.getWorkspaceRootFromUri(uri)
+            val importResult = ImportResolver.expandImports(
+              documentText,
+              filePath,
+              workspaceRoot
+            )
+
+            // Use the expanded text for hover (so imported symbols are available)
+            val textForHover = if (importResult.errors.isEmpty) {
+              importResult.expandedCode.code
+            } else {
+              documentText // Fall back to original if imports fail
+            }
+
             // Use the hover provider to generate hover information
-            hoverProvider.hover(documentText, position) match {
+            hoverProvider.hover(textForHover, position) match {
               case Some(hover) =>
                 Some(successResponse(request.id, hover.asJson))
               case None =>
@@ -342,48 +378,65 @@ class SimpleLspServer(
   private def publishDiagnostics(uri: String, text: String): Unit = {
     import org.ergoplatform.ergoscript.cli.Compiler
     import org.ergoplatform.ergoscript.lsp.analysis.UnusedVariableAnalyzer
+    import org.ergoplatform.ergoscript.lsp.imports.ImportResolver
 
     logger.debug(s"Running diagnostics for $uri")
 
-    // Compile the script to get errors
-    val errorDiagnostics = Compiler.compile(
-      script = text,
-      name = "DiagnosticsCheck",
-      description = "",
-      networkPrefix = 0x00.toByte
-    ) match {
-      case Left(error) =>
-        // Compilation failed - create diagnostic
-        logger.info(
-          s"Compilation error: ${error.message} at line ${error.line}, column ${error.column}"
-        )
+    // Extract file path and workspace root from URI
+    val filePath = uriToFilePath(uri)
+    val workspaceRoot = ImportResolver.getWorkspaceRootFromUri(uri)
 
-        val range = Range(
-          start = Position(
-            line = error.line.getOrElse(1) - 1, // LSP uses 0-based lines
-            character =
-              error.column.getOrElse(1) - 1 // LSP uses 0-based columns
-          ),
-          end = Position(
-            line = error.line.getOrElse(1) - 1,
-            character = error.column.getOrElse(1) + 10 // Highlight ~10 chars
+    // Check if this is a library file (in lib/ directory or just contains function defs)
+    val isLibraryFile = filePath.exists(_.contains("/lib/")) ||
+      isLibraryContent(text)
+
+    // Skip compilation diagnostics for library files - they're not standalone contracts
+    val errorDiagnostics = if (isLibraryFile) {
+      logger.debug(s"Skipping compilation diagnostics for library file: $uri")
+      List.empty[Diagnostic]
+    } else {
+      // Compile the script to get errors (with import support)
+      Compiler.compileWithImports(
+        script = text,
+        name = "DiagnosticsCheck",
+        description = "",
+        filePath = filePath,
+        workspaceRoot = workspaceRoot,
+        networkPrefix = 0x00.toByte
+      ) match {
+        case Left(error) =>
+          // Compilation failed - create diagnostic
+          logger.info(
+            s"Compilation error: ${error.message} at line ${error.line}, column ${error.column}"
           )
-        )
 
-        List(
-          Diagnostic(
-            range = range,
-            severity = Some(1), // Error
-            code = None,
-            source = Some("ergoscript"),
-            message = error.message
+          val range = Range(
+            start = Position(
+              line = error.line.getOrElse(1) - 1, // LSP uses 0-based lines
+              character =
+                error.column.getOrElse(1) - 1 // LSP uses 0-based columns
+            ),
+            end = Position(
+              line = error.line.getOrElse(1) - 1,
+              character = error.column.getOrElse(1) + 10 // Highlight ~10 chars
+            )
           )
-        )
 
-      case Right(_) =>
-        // Compilation succeeded - no errors
-        logger.debug("Compilation successful, no error diagnostics")
-        List.empty[Diagnostic]
+          List(
+            Diagnostic(
+              range = range,
+              severity = Some(1), // Error
+              code = None,
+              source = Some("ergoscript"),
+              message = error.message
+            )
+          )
+
+        case Right(_) =>
+          // Compilation succeeded - no errors
+          logger.debug("Compilation successful, no error diagnostics")
+          List.empty[Diagnostic]
+      }
     }
 
     // Check for unused variables (warnings)
@@ -418,6 +471,34 @@ class SimpleLspServer(
     )
 
     sendNotification("textDocument/publishDiagnostics", params.asJson)
+  }
+
+  /** Check if content appears to be a library file (just function/value
+    * definitions). Library files don't have a top-level contract expression or
+    * \@contract decorator.
+    */
+  private def isLibraryContent(text: String): Boolean = {
+    val trimmed = text.trim
+    // Library files typically:
+    // - Start with val/def definitions
+    // - Don't have @contract
+    // - Don't have a top-level { } expression
+    !trimmed.contains("@contract") &&
+    !trimmed.startsWith("{") &&
+    (trimmed.startsWith("val ") || trimmed.startsWith("def ") ||
+      trimmed.startsWith("//") || trimmed.startsWith("/*"))
+  }
+
+  /** Convert a file:// URI to a file path.
+    */
+  private def uriToFilePath(uri: String): Option[String] = {
+    Try {
+      if (uri.startsWith("file://")) {
+        java.net.URI.create(uri).getPath
+      } else {
+        uri
+      }
+    }.toOption
   }
 
   /** Send a response message.

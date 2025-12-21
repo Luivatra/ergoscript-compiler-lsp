@@ -108,7 +108,10 @@ object CliApp {
 
     result match {
       case Right(compilationResult) =>
-        val json = JsonSerializer.toJson(compilationResult.template)
+        val json = compilationResult.template match {
+          case Some(template) => JsonSerializer.toJson(template)
+          case None           => "{}" // Fallback for non-template compilation
+        }
 
         config.output match {
           case Some(outputPath) =>
