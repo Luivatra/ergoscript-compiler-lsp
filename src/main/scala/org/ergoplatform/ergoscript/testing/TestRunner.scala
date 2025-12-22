@@ -119,9 +119,33 @@ class TestRunner extends LazyLogging {
     logger.debug(s"Running test: ${test.name}")
 
     try {
-      // Compile the contract
-      val compilationResult = Compiler.compileWithImports(
+      // First, expand imports to check if there's a contract after expansion
+      import org.ergoplatform.ergoscript.lsp.imports.ImportResolver
+      val importResult = ImportResolver.expandImports(
         contractSource,
+        testFilePath,
+        workspaceRoot
+      )
+
+      // Detect if this is a library-only test (no @contract annotation after import expansion)
+      val hasContract = importResult.expandedCode.code.contains("@contract")
+
+      // If no contract and we have assertions, create a synthetic contract wrapper
+      val sourceToCompile =
+        if (!hasContract && test.assertions.nonEmpty) {
+          // Library function test - create synthetic contract from first assertion
+          val assertionExpr = test.assertions.head.expression
+          createSyntheticContractFromAssertion(
+            contractSource,
+            assertionExpr
+          )
+        } else {
+          contractSource
+        }
+
+      // Compile the contract (either original or synthetic)
+      val compilationResult = Compiler.compileWithImports(
+        sourceToCompile,
         test.name,
         "",
         testFilePath,
@@ -334,7 +358,7 @@ class TestRunner extends LazyLogging {
   ): Option[Map[String, sigma.ast.Constant[sigma.ast.SType]]] = {
     import sigma.ast._
 
-    // Pattern to match function calls: functionName(param1 = value1, param2 = value2, ...)
+    // Pattern to match function calls: functionName(param1, param2, ...) or functionName(name = value, ...)
     val functionCallPattern = """(\w+)\s*\(([^)]*)\)""".r
 
     functionCallPattern.findFirstMatchIn(expression).flatMap { m =>
@@ -346,35 +370,45 @@ class TestRunner extends LazyLogging {
         return None
       }
 
-      // Parse parameter assignments
-      val paramAssignments = paramsStr.split(",").map(_.trim).filter(_.nonEmpty)
-      val paramMap = paramAssignments.flatMap { assignment =>
-        val parts = assignment.split("=").map(_.trim)
-        if (parts.length == 2) {
-          val paramName = parts(0)
-          val paramValueStr = parts(1)
+      // Parse parameter values (supports both positional and named parameters)
+      val paramValues = paramsStr.split(",").map(_.trim).filter(_.nonEmpty)
+
+      val paramMap =
+        paramValues.zipWithIndex.flatMap { case (paramValue, idx) =>
+          // Check if it's a named parameter (contains '=')
+          val (paramName, valueStr) = if (paramValue.contains("=")) {
+            val parts = paramValue.split("=").map(_.trim)
+            (parts(0), parts(1))
+          } else {
+            // Positional parameter - use template parameter order
+            if (idx < template.parameters.length) {
+              (template.parameters(idx).name, paramValue)
+            } else {
+              return None // Too many positional args
+            }
+          }
 
           // Find the parameter in the template
-          template.parameters.zipWithIndex
-            .find(_._1.name == paramName)
-            .flatMap { case (param, idx) =>
+          template.parameters
+            .find(_.name == paramName)
+            .flatMap { param =>
               val constType = template.constTypes(param.constantIndex)
 
               // Parse the value according to the type
               try {
                 val constant: Constant[SType] = constType match {
                   case SInt =>
-                    IntConstant(paramValueStr.toInt)
+                    IntConstant(valueStr.toInt)
                       .asInstanceOf[Constant[SType]]
                   case SLong =>
                     val longValue =
-                      if (paramValueStr.endsWith("L"))
-                        paramValueStr.dropRight(1).toLong
+                      if (valueStr.endsWith("L"))
+                        valueStr.dropRight(1).toLong
                       else
-                        paramValueStr.toLong
+                        valueStr.toLong
                     LongConstant(longValue).asInstanceOf[Constant[SType]]
                   case SBoolean =>
-                    BooleanConstant(paramValueStr.toBoolean)
+                    BooleanConstant(valueStr.toBoolean)
                       .asInstanceOf[Constant[SType]]
                   case _ =>
                     IntConstant(0).asInstanceOf[Constant[SType]]
@@ -384,13 +418,45 @@ class TestRunner extends LazyLogging {
                 case _: Exception => None
               }
             }
-        } else {
-          None
-        }
-      }.toMap
+        }.toMap
 
       if (paramMap.nonEmpty) Some(paramMap) else None
     }
+  }
+
+  /** Create a synthetic contract from library code and assertion expression.
+    * This allows unit testing of library functions without requiring a
+    * contract.
+    *
+    * @param libraryCode
+    *   The expanded library code (functions, imports, etc.)
+    * @param assertionExpr
+    *   The assertion expression (e.g., "checkHeight(100) == true")
+    * @return
+    *   A synthetic contract that wraps the assertion expression
+    */
+  private def createSyntheticContractFromAssertion(
+      libraryCode: String,
+      assertionExpr: String
+  ): String = {
+    // Extract the expression before '==' or '!='
+    val expr = if (assertionExpr.contains("==")) {
+      assertionExpr.split("==")(0).trim
+    } else if (assertionExpr.contains("!=")) {
+      assertionExpr.split("!=")(0).trim
+    } else {
+      assertionExpr.trim
+    }
+
+    // Create synthetic contract wrapping the expression
+    // Note: We use a simple contract expression without @contract annotation
+    // because after import expansion, library functions will be included
+    // which makes @contract templates invalid
+    s"""{
+       |  $libraryCode
+       |  $expr
+       |}
+     """.stripMargin
   }
 
   /** Remove @test and @fixture blocks from source to get clean contract code.

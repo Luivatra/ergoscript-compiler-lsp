@@ -101,13 +101,13 @@ object Commands {
       case _         => 0x00.toByte
     }
 
-    // Find workspace root
-    val workspaceRoot = findWorkspaceRoot()
-
-    // Determine test files
+    // Determine test files first
     val testFiles = if (testConfig.files.nonEmpty) {
       testConfig.files.map(Paths.get(_))
     } else {
+      // Find workspace root from current directory for auto-discovery
+      val workspaceRoot = findWorkspaceRoot()
+
       // Find all .test.es files in tests/ directory
       workspaceRoot match {
         case Some(root) =>
@@ -134,6 +134,16 @@ object Commands {
     }
 
     println(s"Running ${testFiles.length} test file(s)...\n")
+
+    // Find workspace root from the first test file's location
+    // This ensures imports are resolved correctly when running with absolute paths
+    import org.ergoplatform.ergoscript.lsp.imports.ImportResolver
+    val workspaceRoot = testFiles.headOption
+      .flatMap { testFile =>
+        val absolutePath = testFile.toAbsolutePath
+        ImportResolver.findProjectRoot(absolutePath).map(_.toString)
+      }
+      .orElse(findWorkspaceRoot())
 
     // Run tests
     val runner = new TestRunner()
