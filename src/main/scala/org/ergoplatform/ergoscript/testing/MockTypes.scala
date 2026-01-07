@@ -148,11 +148,14 @@ case class TestAssertion(
   *   Whether the assertion passed
   * @param message
   *   Result message
+  * @param trace
+  *   Optional evaluation trace (when tracing is enabled)
   */
 case class AssertionResult(
     assertion: TestAssertion,
     passed: Boolean,
-    message: String
+    message: String,
+    trace: Option[TracedEvaluation] = None
 )
 
 /** Result of a test execution.

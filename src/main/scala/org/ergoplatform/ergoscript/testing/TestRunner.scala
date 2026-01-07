@@ -11,6 +11,21 @@ import java.nio.file.{Files, Path}
 import scala.util.{Try, Success, Failure}
 import com.typesafe.scalalogging.LazyLogging
 
+/** Configuration for test tracing.
+  *
+  * @param enabled
+  *   Whether tracing is enabled
+  * @param format
+  *   Output format: "tree", "json", or "compact"
+  * @param onFailureOnly
+  *   Whether to only trace failed tests
+  */
+case class TraceConfig(
+    enabled: Boolean = false,
+    format: String = "tree",
+    onFailureOnly: Boolean = true
+)
+
 /** Runs ErgoScript tests and evaluates assertions.
   *
   * Note: This is a basic implementation of the testing framework. Full test
@@ -28,13 +43,16 @@ class TestRunner extends LazyLogging {
     *   Workspace root for resolving imports and constants
     * @param networkPrefix
     *   Network prefix
+    * @param traceConfig
+    *   Configuration for tracing
     * @return
     *   Test suite result
     */
   def runTestFile(
       filePath: Path,
       workspaceRoot: Option[String] = None,
-      networkPrefix: Byte = 0x00
+      networkPrefix: Byte = 0x00,
+      traceConfig: TraceConfig = TraceConfig()
   ): TestSuiteResult = {
     val startTime = System.currentTimeMillis()
 
@@ -68,6 +86,13 @@ class TestRunner extends LazyLogging {
     // Compile contracts in the file
     val contractSource = removeTestBlocks(source)
 
+    // Build source position map if tracing is enabled
+    val sourceMap = if (traceConfig.enabled) {
+      Some(SourcePositionMap.fromSource(source, filePath.getFileName.toString))
+    } else {
+      None
+    }
+
     // Run each test
     val results = tests.map { test =>
       runTest(
@@ -75,7 +100,9 @@ class TestRunner extends LazyLogging {
         contractSource,
         Some(filePath.toString),
         workspaceRoot,
-        networkPrefix
+        networkPrefix,
+        traceConfig,
+        sourceMap
       )
     }
 
@@ -104,6 +131,10 @@ class TestRunner extends LazyLogging {
     *   Workspace root
     * @param networkPrefix
     *   Network prefix
+    * @param traceConfig
+    *   Configuration for tracing
+    * @param sourceMap
+    *   Optional source position map for tracing
     * @return
     *   Test result
     */
@@ -112,7 +143,9 @@ class TestRunner extends LazyLogging {
       contractSource: String,
       testFilePath: Option[String],
       workspaceRoot: Option[String],
-      networkPrefix: Byte
+      networkPrefix: Byte,
+      traceConfig: TraceConfig = TraceConfig(),
+      sourceMap: Option[SourcePositionMap] = None
   ): TestResult = {
     val startTime = System.currentTimeMillis()
 
@@ -199,7 +232,12 @@ class TestRunner extends LazyLogging {
                   assertion,
                   ctx,
                   treeToEvaluate,
-                  networkPrefix
+                  networkPrefix,
+                  traceConfig,
+                  result.sourceMap.orElse(
+                    sourceMap
+                  ), // Use compilation source map if available
+                  result.expandedCode // Pass expanded code for import source mapping
                 )
               }
 
@@ -256,28 +294,55 @@ class TestRunner extends LazyLogging {
       assertion: TestAssertion,
       context: ErgoLikeContext,
       contractTree: ErgoTree,
-      networkPrefix: Byte
+      networkPrefix: Byte,
+      traceConfig: TraceConfig = TraceConfig(),
+      sourceMap: Option[SourcePositionMap] = None,
+      expandedCode: Option[
+        org.ergoplatform.ergoscript.lsp.imports.ExpandedCode
+      ] = None
   ): AssertionResult = {
     assertion.assertionType match {
       case AssertionType.Equals =>
-        evaluateEqualsAssertion(assertion, context, contractTree, networkPrefix)
+        evaluateEqualsAssertion(
+          assertion,
+          context,
+          contractTree,
+          networkPrefix,
+          traceConfig,
+          sourceMap,
+          expandedCode
+        )
       case AssertionType.NotEquals =>
         val result = evaluateEqualsAssertion(
           assertion,
           context,
           contractTree,
-          networkPrefix
+          networkPrefix,
+          traceConfig,
+          sourceMap,
+          expandedCode
         )
         result.copy(passed = !result.passed)
       case AssertionType.Provable =>
         // For now, treat as equals
-        evaluateEqualsAssertion(assertion, context, contractTree, networkPrefix)
+        evaluateEqualsAssertion(
+          assertion,
+          context,
+          contractTree,
+          networkPrefix,
+          traceConfig,
+          sourceMap,
+          expandedCode
+        )
       case AssertionType.NotProvable =>
         val result = evaluateEqualsAssertion(
           assertion,
           context,
           contractTree,
-          networkPrefix
+          networkPrefix,
+          traceConfig,
+          sourceMap,
+          expandedCode
         )
         result.copy(passed = !result.passed)
     }
@@ -293,35 +358,27 @@ class TestRunner extends LazyLogging {
       assertion: TestAssertion,
       context: ErgoLikeContext,
       contractTree: ErgoTree,
-      networkPrefix: Byte
+      networkPrefix: Byte,
+      traceConfig: TraceConfig = TraceConfig(),
+      sourceMap: Option[SourcePositionMap] = None,
+      expandedCode: Option[
+        org.ergoplatform.ergoscript.lsp.imports.ExpandedCode
+      ] = None
   ): AssertionResult = {
     Try {
       val expectedValue = assertion.expected.getOrElse("true").toLowerCase
       val expectedBool = expectedValue == "true"
 
-      // Actually evaluate the contract with the context
-      import sigmastate.interpreter.CErgoTreeEvaluator
-      import sigma.VersionContext
+      // Use tracing evaluator if tracing is enabled
+      if (traceConfig.enabled) {
+        val tracingEvaluator =
+          new TracingEvaluator(context, contractTree, sourceMap, expandedCode)
+        val tracedResult = tracingEvaluator.evaluateWithTrace()
 
-      // Set the global version context to match the contract version
-      val treeVersion = contractTree.version
-      VersionContext.withVersions(treeVersion, treeVersion) {
-        val reductionResult = CErgoTreeEvaluator.evalToCrypto(
-          context,
-          contractTree,
-          CErgoTreeEvaluator.DefaultEvalSettings
-        )
+        val passed = tracedResult.result == expectedBool
 
-        // Check if evaluation result matches expected
-        import sigma.data.TrivialProp
-        val actualResult = reductionResult.value match {
-          case TrivialProp.TrueProp  => true
-          case TrivialProp.FalseProp => false
-          case _ =>
-            true // SigmaProp that needs proving - consider as potentially true for now
-        }
-
-        val passed = actualResult == expectedBool
+        // Only include trace if we should (based on config)
+        val includeTrace = !traceConfig.onFailureOnly || !passed
 
         AssertionResult(
           assertion = assertion,
@@ -329,9 +386,45 @@ class TestRunner extends LazyLogging {
           message = if (passed) {
             s"✓ ${assertion.description.getOrElse(assertion.expression)}"
           } else {
-            s"✗ ${assertion.description.getOrElse(assertion.expression)}: expected $expectedValue, got $actualResult"
-          }
+            s"✗ ${assertion.description.getOrElse(assertion.expression)}: expected $expectedValue, got ${tracedResult.result}"
+          },
+          trace = if (includeTrace) Some(tracedResult) else None
         )
+      } else {
+        // Standard evaluation without tracing
+        import sigmastate.interpreter.CErgoTreeEvaluator
+        import sigma.VersionContext
+
+        // Set the global version context to match the contract version
+        val treeVersion = contractTree.version
+        VersionContext.withVersions(treeVersion, treeVersion) {
+          val reductionResult = CErgoTreeEvaluator.evalToCrypto(
+            context,
+            contractTree,
+            CErgoTreeEvaluator.DefaultEvalSettings
+          )
+
+          // Check if evaluation result matches expected
+          import sigma.data.TrivialProp
+          val actualResult = reductionResult.value match {
+            case TrivialProp.TrueProp  => true
+            case TrivialProp.FalseProp => false
+            case _ =>
+              true // SigmaProp that needs proving - consider as potentially true for now
+          }
+
+          val passed = actualResult == expectedBool
+
+          AssertionResult(
+            assertion = assertion,
+            passed = passed,
+            message = if (passed) {
+              s"✓ ${assertion.description.getOrElse(assertion.expression)}"
+            } else {
+              s"✗ ${assertion.description.getOrElse(assertion.expression)}: expected $expectedValue, got $actualResult"
+            }
+          )
+        }
       }
     } match {
       case Success(result) => result
@@ -494,9 +587,12 @@ class TestRunner extends LazyLogging {
   def runTestFiles(
       files: List[Path],
       workspaceRoot: Option[String] = None,
-      networkPrefix: Byte = 0x00
+      networkPrefix: Byte = 0x00,
+      traceConfig: TraceConfig = TraceConfig()
   ): List[TestSuiteResult] = {
-    files.map(file => runTestFile(file, workspaceRoot, networkPrefix))
+    files.map(file =>
+      runTestFile(file, workspaceRoot, networkPrefix, traceConfig)
+    )
   }
 }
 

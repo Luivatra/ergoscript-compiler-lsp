@@ -7,6 +7,7 @@ import sigma.compiler.{SigmaCompiler, SigmaTemplateCompiler}
 import sigma.compiler.ir.IRContext
 import sigma.SigmaException
 import sigmastate.lang.{ContractParser, ParsedContractTemplate}
+import fastparse.Parsed
 import scorex.util.encode.Base16
 import com.typesafe.scalalogging.LazyLogging
 
@@ -14,7 +15,11 @@ import scala.util.{Try, Success, Failure}
 
 case class CompilationResult(
     ergoTree: ErgoTree,
-    template: Option[ContractTemplate] = None
+    template: Option[ContractTemplate] = None,
+    sourceMap: Option[org.ergoplatform.ergoscript.testing.SourcePositionMap] =
+      None,
+    expandedCode: Option[org.ergoplatform.ergoscript.lsp.imports.ExpandedCode] =
+      None
 )
 
 case class CompilationError(
@@ -148,7 +153,8 @@ object Compiler extends LazyLogging {
         expandedScript,
         finalNetworkPrefix,
         treeVersion,
-        Some(expandedCode)
+        Some(expandedCode),
+        filePath
       )
     } else {
       compileStandard(
@@ -157,7 +163,8 @@ object Compiler extends LazyLogging {
         description,
         finalNetworkPrefix,
         treeVersion,
-        Some(expandedCode)
+        Some(expandedCode),
+        filePath
       )
     }
   }
@@ -217,7 +224,8 @@ object Compiler extends LazyLogging {
       networkPrefix: Byte,
       treeVersion: Byte,
       sourceMap: Option[org.ergoplatform.ergoscript.lsp.imports.ExpandedCode] =
-        None
+        None,
+      filePath: Option[String] = None
   ): Either[CompilationError, CompilationResult] = {
     // For templates, inline library functions into the template body
     val (processedScript, adjustedSourceMap) =
@@ -231,6 +239,67 @@ object Compiler extends LazyLogging {
       }
 
     Try {
+      // Use ContractParser to get the parsed template with source context
+      // This is the key fix: ContractParser.parse() returns ParsedContractTemplate
+      // where body is an SValue that already has SourceContext attached by SigmaParser
+      import org.ergoplatform.ergoscript.testing.{
+        AstSourceMapper,
+        SourcePositionMap
+      }
+
+      val sigmaCompiler = SigmaCompiler(networkPrefix)
+
+      // Parse the template to extract the body with source context
+      val positionMap: Option[SourcePositionMap] =
+        ContractParser.parse(processedScript) match {
+          case Parsed.Success(parsedTemplate, _) =>
+            // Build parameter type environment from template signature
+            val parEnv: Map[String, Any] = parsedTemplate.signature.params.map {
+              p =>
+                p.name -> p.tpe
+            }.toMap
+
+            // Typecheck the body (which already has source context from parsing)
+            // The body positions are relative to the body text, so we need to adjust
+            val typedBody =
+              Try(sigmaCompiler.typecheck(parEnv, parsedTemplate.body))
+
+            // Calculate line offset: where does the body start in the full source?
+            val bodyStartLine = calculateBodyStartLine(processedScript)
+
+            typedBody.toOption match {
+              case Some(ast) =>
+                // Extract positions and adjust for body offset
+                val fileName = filePath.getOrElse("<script>")
+                val rawMap =
+                  AstSourceMapper.fromAst(ast, fileName, adjustedSourceMap)
+                val adjustedMap =
+                  adjustPositionsForBodyOffset(rawMap, bodyStartLine)
+                logger.debug(
+                  s"Template: Extracted ${adjustedMap.mappings.length} source positions (offset: $bodyStartLine)"
+                )
+                if (adjustedMap.mappings.nonEmpty) {
+                  logger.debug(
+                    s"Template sample positions: ${adjustedMap.mappings
+                        .take(5)
+                        .map(m => s"${m.exprType}@${m.sourcePos.line}:${m.sourcePos.column}")
+                        .mkString(", ")}"
+                  )
+                }
+                Some(adjustedMap)
+              case None =>
+                logger.warn(
+                  "Could not typecheck template body for source position extraction"
+                )
+                None
+            }
+          case f: Parsed.Failure =>
+            logger.warn(
+              s"Could not parse template for source position extraction: $f"
+            )
+            None
+        }
+
       val templateCompiler = SigmaTemplateCompiler(networkPrefix)
       val template = templateCompiler.compile(processedScript)
 
@@ -255,7 +324,12 @@ object Compiler extends LazyLogging {
 
       val ergoTree = template.applyTemplate(Some(treeVersion), paramConstants)
 
-      CompilationResult(ergoTree, Some(template))
+      CompilationResult(
+        ergoTree,
+        Some(template),
+        positionMap,
+        adjustedSourceMap
+      )
     } match {
       case Success(result) => Right(result)
       case Failure(ex) =>
@@ -282,13 +356,36 @@ object Compiler extends LazyLogging {
       networkPrefix: Byte,
       treeVersion: Byte,
       sourceMap: Option[org.ergoplatform.ergoscript.lsp.imports.ExpandedCode] =
-        None
+        None,
+      filePath: Option[String] = None
   ): Either[CompilationError, CompilationResult] = {
     Try {
       // Use SigmaCompiler to compile ErgoScript
       val compiler = SigmaCompiler(networkPrefix)
       val env = Map.empty[String, Any]
-      val compilerResult = compiler.compile(env, script)
+
+      // Get typed AST for source position mapping
+      val typedAst = compiler.typecheck(env, script)
+
+      // Extract source positions from typed AST
+      // Pass sourceMap (ExpandedCode) so AstSourceMapper can resolve import positions
+      import org.ergoplatform.ergoscript.testing.AstSourceMapper
+      val fileName = filePath.getOrElse("<script>")
+      val positionMap = AstSourceMapper.fromAst(typedAst, fileName, sourceMap)
+
+      // Debug: log the number of positions extracted
+      logger.debug(
+        s"Extracted ${positionMap.mappings.length} source positions from AST"
+      )
+      if (positionMap.mappings.nonEmpty) {
+        logger.debug(s"Sample positions: ${positionMap.mappings
+            .take(3)
+            .map(m => s"${m.exprType}@${m.sourcePos.line}:${m.sourcePos.column}")
+            .mkString(", ")}")
+      }
+
+      // Compile the typed AST
+      val compilerResult = compiler.compileTyped(env, typedAst)
 
       // Build the ErgoTree from the CompilerResult
       val value = compilerResult.buildTree
@@ -316,7 +413,7 @@ object Compiler extends LazyLogging {
         expressionTree = value.toSigmaProp
       )
 
-      CompilationResult(ergoTree, Some(template))
+      CompilationResult(ergoTree, Some(template), Some(positionMap), sourceMap)
 
     } match {
       case Success(result) => Right(result)
@@ -736,6 +833,49 @@ object Compiler extends LazyLogging {
         // If we can't find the pattern, return 0 (no offset)
         0
     }
+  }
+
+  /** Calculate the line number where the template body starts. The body
+    * positions from SigmaParser are relative to the body text (starting at line
+    * 1), so we need to know the offset to adjust them to the full source.
+    */
+  private def calculateBodyStartLine(script: String): Int = {
+    // Find the "= {" or "=" followed by the body
+    // The pattern accounts for potential whitespace and opening brace
+    val pattern = """@contract\s+def\s+\w+\s*\([^)]*\)\s*=\s*\{?""".r
+    pattern.findFirstMatchIn(script) match {
+      case Some(m) =>
+        // Count newlines up to and including the match
+        script.substring(0, m.end).count(_ == '\n')
+      case None => 0
+    }
+  }
+
+  /** Adjust all positions in a source map by adding a line offset. This is
+    * needed because template body positions are relative to the body text, not
+    * the full source file.
+    */
+  private def adjustPositionsForBodyOffset(
+      sourceMap: org.ergoplatform.ergoscript.testing.SourcePositionMap,
+      lineOffset: Int
+  ): org.ergoplatform.ergoscript.testing.SourcePositionMap = {
+    import org.ergoplatform.ergoscript.testing.{
+      SourcePositionMap,
+      SourcePosition,
+      ExpressionMapping
+    }
+
+    val adjustedMappings = sourceMap.mappings.map { mapping =>
+      mapping.copy(
+        sourcePos = mapping.sourcePos.copy(
+          line = mapping.sourcePos.line + lineOffset
+        )
+      )
+    }
+    val adjustedSourceLines = sourceMap.sourceLines.map { case (line, text) =>
+      (line + lineOffset) -> text
+    }
+    SourcePositionMap(adjustedMappings, adjustedSourceLines)
   }
 
   /** Adjust column position for method call errors in chained calls. When a

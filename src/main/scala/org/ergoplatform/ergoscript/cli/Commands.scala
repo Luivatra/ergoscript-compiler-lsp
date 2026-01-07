@@ -1,6 +1,11 @@
 package org.ergoplatform.ergoscript.cli
 
-import org.ergoplatform.ergoscript.testing.{TestRunner, TestSuiteResult}
+import org.ergoplatform.ergoscript.testing.{
+  TestRunner,
+  TestSuiteResult,
+  TraceConfig,
+  TraceFormatter
+}
 import org.ergoplatform.ergoscript.project.ProjectConfigParser
 import scopt.OParser
 import java.nio.file.{Files, Path, Paths}
@@ -14,7 +19,10 @@ case class TestCommand(
     files: List[String] = List.empty,
     verbose: Boolean = false,
     filter: Option[String] = None,
-    network: String = "mainnet"
+    network: String = "mainnet",
+    trace: Boolean = false,
+    traceFormat: String = "tree",
+    traceOnFailureOnly: Boolean = true
 ) extends Command
 case class InitCommand(
     name: String = "my-ergo-project",
@@ -79,6 +87,7 @@ object Commands {
       |
       |Test Command:
       |  ergoscript test [files...] [--verbose] [--filter <pattern>] [--network mainnet|testnet]
+      |                  [--trace] [--trace-format tree|json|compact] [--trace-all]
       |
       |Init Command:
       |  ergoscript init [--name <project-name>] [--description <desc>]
@@ -87,6 +96,9 @@ object Commands {
       |  ergoscript compile -i src/main.es -o build/main.json
       |  ergoscript test tests/main.test.es --verbose
       |  ergoscript test --filter "testHeight*"
+      |  ergoscript test --trace                    # Show trace on failed tests
+      |  ergoscript test --trace --trace-all        # Show trace on all tests
+      |  ergoscript test --trace --trace-format json
       |  ergoscript init --name my-project
       |
       """.stripMargin)
@@ -145,13 +157,30 @@ object Commands {
       }
       .orElse(findWorkspaceRoot())
 
+    // Create trace config
+    val traceConfig = TraceConfig(
+      enabled = testConfig.trace,
+      format = testConfig.traceFormat,
+      onFailureOnly = testConfig.traceOnFailureOnly
+    )
+
     // Run tests
     val runner = new TestRunner()
     val results =
-      runner.runTestFiles(testFiles.toList, workspaceRoot, networkPrefix)
+      runner.runTestFiles(
+        testFiles.toList,
+        workspaceRoot,
+        networkPrefix,
+        traceConfig
+      )
 
     // Print results
-    printTestResults(results, testConfig.verbose)
+    printTestResults(
+      results,
+      testConfig.verbose,
+      testConfig.trace,
+      testConfig.traceFormat
+    )
 
     // Exit with appropriate code
     val allPassed = results.forall(_.failed == 0)
@@ -163,6 +192,9 @@ object Commands {
     var verbose = false
     var filter: Option[String] = None
     var network = "mainnet"
+    var trace = false
+    var traceFormat = "tree"
+    var traceOnFailureOnly = true
 
     var i = 0
     while (i < args.length) {
@@ -179,6 +211,21 @@ object Commands {
             network = args(i + 1)
             i += 1
           }
+        case "--trace" =>
+          trace = true
+        case "--trace-format" =>
+          if (i + 1 < args.length) {
+            traceFormat = args(i + 1).toLowerCase
+            if (!Set("tree", "json", "compact").contains(traceFormat)) {
+              System.err.println(
+                s"Unknown trace format: $traceFormat. Using 'tree'."
+              )
+              traceFormat = "tree"
+            }
+            i += 1
+          }
+        case "--trace-all" =>
+          traceOnFailureOnly = false
         case arg if !arg.startsWith("-") =>
           files = files :+ arg
         case _ =>
@@ -187,7 +234,15 @@ object Commands {
       i += 1
     }
 
-    TestCommand(files, verbose, filter, network)
+    TestCommand(
+      files,
+      verbose,
+      filter,
+      network,
+      trace,
+      traceFormat,
+      traceOnFailureOnly
+    )
   }
 
   private def findWorkspaceRoot(): Option[String] = {
@@ -215,7 +270,9 @@ object Commands {
 
   private def printTestResults(
       results: List[TestSuiteResult],
-      verbose: Boolean
+      verbose: Boolean,
+      showTrace: Boolean = false,
+      traceFormat: String = "tree"
   ): Unit = {
     results.foreach { suite =>
       println(s"${suite.file}:")
@@ -226,9 +283,37 @@ object Commands {
 
         println(s"  $status ${test.name} ($duration)")
 
-        if (verbose || !test.passed) {
+        // Show assertions if verbose, test failed, or we have traces to show
+        val shouldShowAssertions =
+          verbose || !test.passed || (showTrace && test.assertions.exists(
+            _.trace.isDefined
+          ))
+
+        if (shouldShowAssertions) {
           test.assertions.foreach { assertion =>
             println(s"    ${assertion.message}")
+
+            // Show trace if available and tracing is enabled
+            if (showTrace && assertion.trace.isDefined) {
+              val trace = assertion.trace.get
+              println(
+                s"    Cost: ${trace.totalCost}, Operations: ${trace.operationCount}"
+              )
+              println()
+              println("    Evaluation Trace:")
+
+              val formattedTrace = traceFormat.toLowerCase match {
+                case "json"    => TraceFormatter.formatAsJson(trace.rootTrace)
+                case "compact" => TraceFormatter.formatCompact(trace.rootTrace)
+                case _         => TraceFormatter.formatAsTree(trace.rootTrace)
+              }
+
+              // Indent the trace output
+              formattedTrace.split("\n").foreach { line =>
+                println(s"      $line")
+              }
+              println()
+            }
           }
         }
 
