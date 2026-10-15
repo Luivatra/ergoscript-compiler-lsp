@@ -6,6 +6,7 @@ import sigma.serialization.ErgoTreeSerializer
 import sigma.compiler.{SigmaCompiler, SigmaTemplateCompiler}
 import sigma.compiler.ir.IRContext
 import sigma.SigmaException
+import sigma.VersionContext
 import sigmastate.lang.{ContractParser, ParsedContractTemplate}
 import fastparse.Parsed
 import scorex.util.encode.Base16
@@ -239,15 +240,19 @@ object Compiler extends LazyLogging {
       }
 
     Try {
-      // Use ContractParser to get the parsed template with source context
-      // This is the key fix: ContractParser.parse() returns ParsedContractTemplate
-      // where body is an SValue that already has SourceContext attached by SigmaParser
-      import org.ergoplatform.ergoscript.testing.{
-        AstSourceMapper,
-        SourcePositionMap
-      }
+      // Set VersionContext to enable ErgoTree v3+ features like getVarFromInput
+      // This is required because sigma-state's GraphBuilding phase checks
+      // VersionContext.current.isV3OrLaterErgoTreeVersion for certain operations
+      VersionContext.withVersions(treeVersion, treeVersion) {
+        // Use ContractParser to get the parsed template with source context
+        // This is the key fix: ContractParser.parse() returns ParsedContractTemplate
+        // where body is an SValue that already has SourceContext attached by SigmaParser
+        import org.ergoplatform.ergoscript.testing.{
+          AstSourceMapper,
+          SourcePositionMap
+        }
 
-      val sigmaCompiler = SigmaCompiler(networkPrefix)
+        val sigmaCompiler = SigmaCompiler(networkPrefix)
 
       // Parse the template to extract the body with source context
       val positionMap: Option[SourcePositionMap] =
@@ -306,6 +311,14 @@ object Compiler extends LazyLogging {
       // For templates, we create placeholder constants for parameters
       // This allows the template to be stored and later bound with actual values
       import sigma.ast._
+      import sigma.data.CSigmaDslBuilder
+      import sigma.Colls
+      import scorex.util.encode.Base16
+      
+      // secp256k1 generator point G (compressed) as placeholder for GroupElement
+      val generatorPointBytes = Base16.decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").get
+      val placeholderGroupElement = CSigmaDslBuilder.decodePoint(Colls.fromArray(generatorPointBytes))
+      
       val paramConstants = template.parameters
         .zip(template.constTypes)
         .map { case (param, constType) =>
@@ -315,21 +328,26 @@ object Compiler extends LazyLogging {
             case SLong => LongConstant(0L).asInstanceOf[Constant[SType]]
             case SBoolean =>
               BooleanConstant(false).asInstanceOf[Constant[SType]]
-            case _ =>
-              IntConstant(0).asInstanceOf[Constant[SType]] // Default fallback
+            case SGroupElement =>
+              GroupElementConstant(placeholderGroupElement).asInstanceOf[Constant[SType]]
+            case SCollectionType(SByte) =>
+              // Empty Coll[Byte] as placeholder
+              CollectionConstant[SByte.type](Colls.fromArray(Array.empty[Byte]), SByte).asInstanceOf[Constant[SType]]
+            case other =>
+              throw new IllegalArgumentException(s"Unsupported parameter type: $other for parameter ${param.name}")
           }
           param.name -> constant
         }
         .toMap
-
       val ergoTree = template.applyTemplate(Some(treeVersion), paramConstants)
 
-      CompilationResult(
-        ergoTree,
-        Some(template),
-        positionMap,
-        adjustedSourceMap
-      )
+        CompilationResult(
+          ergoTree,
+          Some(template),
+          positionMap,
+          adjustedSourceMap
+        )
+      } // end VersionContext.withVersions
     } match {
       case Success(result) => Right(result)
       case Failure(ex) =>
@@ -360,12 +378,14 @@ object Compiler extends LazyLogging {
       filePath: Option[String] = None
   ): Either[CompilationError, CompilationResult] = {
     Try {
-      // Use SigmaCompiler to compile ErgoScript
-      val compiler = SigmaCompiler(networkPrefix)
-      val env = Map.empty[String, Any]
+      // Set VersionContext to enable ErgoTree v3+ features like getVarFromInput
+      VersionContext.withVersions(treeVersion, treeVersion) {
+        // Use SigmaCompiler to compile ErgoScript
+        val compiler = SigmaCompiler(networkPrefix)
+        val env = Map.empty[String, Any]
 
-      // Get typed AST for source position mapping
-      val typedAst = compiler.typecheck(env, script)
+        // Get typed AST for source position mapping
+        val typedAst = compiler.typecheck(env, script)
 
       // Extract source positions from typed AST
       // Pass sourceMap (ExpandedCode) so AstSourceMapper can resolve import positions
@@ -404,7 +424,8 @@ object Compiler extends LazyLogging {
       }
 
       // Create basic template without parameters (standard compilation)
-      val template = ContractTemplate(
+      val template = new ContractTemplate(
+        treeVersion = Some(treeVersion),
         name = name,
         description = description,
         constTypes = constTypes,
@@ -413,8 +434,8 @@ object Compiler extends LazyLogging {
         expressionTree = value.toSigmaProp
       )
 
-      CompilationResult(ergoTree, Some(template), Some(positionMap), sourceMap)
-
+        CompilationResult(ergoTree, Some(template), Some(positionMap), sourceMap)
+      } // end VersionContext.withVersions
     } match {
       case Success(result) => Right(result)
       case Failure(ex) =>

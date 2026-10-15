@@ -51,6 +51,7 @@ object JsonSerializer {
         val expressionTreeHex = "0x" + Base16.encode(w.toBytes)
 
         Json.obj(
+          ("treeVersion", template.treeVersion.map(v => Json.fromInt(v.toInt)).getOrElse(Json.Null)),
           ("name", Json.fromString(template.name)),
           ("description", Json.fromString(template.description)),
           ("constTypes", Json.arr(constTypesJson: _*)),
