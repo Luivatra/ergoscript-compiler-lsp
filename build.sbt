@@ -16,7 +16,7 @@ ThisBuild / libraryDependencySchemes ++= Seq(
 // Main dependency - sigmastate-interpreter (sc module contains the compiler)
 libraryDependencies ++= Seq(
   // Sigma State - ErgoScript compiler and interpreter (includes SigmaCompiler)
-  "org.scorexfoundation" %% "sigma-state" % "6.0.2-0-23dd29f6-20260404-1947-SNAPSHOT",
+  "org.scorexfoundation" %% "sigma-state" % "6.0.7",
 
   // NOTE: We implement LSP protocol directly using Circe instead of lsp4j
   // to avoid Scala/Java annotation compatibility issues
